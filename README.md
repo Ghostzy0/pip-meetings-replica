@@ -6,6 +6,8 @@ An independent local macOS recreation effort for selected meeting-workflow patte
 
 **Known native limits (24 Oct 2026):** One same-binary synthetic run failed to open note detail and a process sample showed the main thread blocked in a filesystem permission call during library initialization; the operating-system/filesystem cause is unconfirmed. A later run with a separate temporary data root opened the note, saved/reopened title and notes edits, and added a manual action. This is partial evidence only: it does not establish why the first run stalled, full CRUD, or export.
 
+[![Verify exported Meetings product](https://github.com/Ghostzy0/pip-meetings-replica/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/Ghostzy0/pip-meetings-replica/actions/workflows/verify.yml) · [Verification](PUBLIC-VERIFICATION.md) · [Report an issue](https://github.com/Ghostzy0/pip-meetings-replica/issues/1) · [Pip Meetings custom edition](https://github.com/Ghostzy0/pip-meetings)
+
 ## What it does
 
 - Explicit native recording and local audio processing through the Meeting Transcriber foundation.

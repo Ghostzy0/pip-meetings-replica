@@ -500,65 +500,89 @@ private struct MeetingsReplicaDetail: View {
 
     private var transcriptDrawer: some View {
         GeometryReader { proxy in
+            transcriptDrawerFrame(height: proxy.size.height)
+        }
+    }
+
+    private func transcriptDrawerFrame(height: CGFloat) -> some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("Transcript").font(.system(size: 15, weight: .semibold))
-                Spacer()
-                Button("Copy") { copyTranscript() }.disabled(draft.transcript.isEmpty && record.currentEvidenceSpans.isEmpty)
-                Button { showTranscript = false } label: { Image(systemName: "xmark") }.accessibilityLabel("Close transcript")
-            }
-            .padding(14)
-            TextField("Find in transcript", text: $transcriptQuery)
-                .textFieldStyle(.roundedBorder).padding(.horizontal, 14).padding(.bottom, 8)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Working transcript").font(.system(size: 12, weight: .medium)).foregroundStyle(secondary)
-                    TextEditor(text: $draft.transcript)
-                        .font(.system(size: 14)).scrollContentBackground(.hidden)
-                        .frame(minHeight: 100).accessibilityLabel("Editable working transcript")
-                    if draft.transcript.isEmpty && record.currentEvidenceSpans.isEmpty {
-                        Text("Import a local recording or write a transcript here.")
-                            .font(.system(size: 12)).foregroundStyle(secondary)
-                    }
-                    ForEach(visibleSpans) { span in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 8) {
-                                Text(Self.time(span.start) + "–" + Self.time(span.end)).monospacedDigit()
-                                if !span.speaker.isEmpty { Text(span.speaker) }
-                            }
-                            .font(.system(size: 11, weight: .medium)).foregroundStyle(secondary)
-                            Text(span.text).font(.system(size: 14))
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(11)
-                        .background(panel, in: RoundedRectangle(cornerRadius: 10))
-                    }
-                    if !transcriptQuery.isEmpty && visibleSpans.isEmpty {
-                        Text("No transcript passages match this search.").foregroundStyle(secondary)
-                    }
-                }
-                .frame(maxWidth: 700, alignment: .leading)
-                .padding(.horizontal, 14).padding(.bottom, 14)
-                .frame(maxWidth: .infinity, alignment: .top)
-            }
-            HStack {
-                Label(capture.phase == .recording ? "Recording" : capture.phase == .paused ? "Paused" : "Local transcript", systemImage: capture.phase == .recording ? "waveform" : "waveform")
-                    .font(.system(size: 12)).foregroundStyle(secondary)
-                Spacer()
-                if capture.phase == .paused || capture.phase == .interrupted {
-                    Button("Resume") { Task { await capture.resume(appState: appState) } }.disabled(capture.storageProblem)
-                }
-            }
-            .padding(13).overlay(alignment: .top) { Rectangle().fill(Color(nsColor: .separatorColor)).frame(height: 0.5) }
+            transcriptDrawerHeader
+            transcriptSearchField
+            transcriptPassages
+            transcriptDrawerFooter
         }
         .frame(maxWidth: .infinity)
-        .frame(height: min(480, max(240, proxy.size.height * 0.62)))
+        .frame(height: min(480, max(240, height * 0.62)))
         .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 18))
         .overlay { RoundedRectangle(cornerRadius: 18).strokeBorder(Color(nsColor: .separatorColor)) }
         .shadow(color: .black.opacity(scheme == .dark ? 0.24 : 0.12), radius: 18, y: -5)
         .padding(.horizontal, 12).padding(.bottom, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+    }
+
+    private var transcriptDrawerHeader: some View {
+        HStack {
+            Text("Transcript").font(.system(size: 15, weight: .semibold))
+            Spacer()
+            Button("Copy") { copyTranscript() }.disabled(draft.transcript.isEmpty && record.currentEvidenceSpans.isEmpty)
+            Button { showTranscript = false } label: { Image(systemName: "xmark") }.accessibilityLabel("Close transcript")
         }
+        .padding(14)
+    }
+
+    private var transcriptSearchField: some View {
+        TextField("Find in transcript", text: $transcriptQuery)
+            .textFieldStyle(.roundedBorder).padding(.horizontal, 14).padding(.bottom, 8)
+    }
+
+    private var transcriptPassages: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Working transcript").font(.system(size: 12, weight: .medium)).foregroundStyle(secondary)
+                TextEditor(text: $draft.transcript)
+                    .font(.system(size: 14)).scrollContentBackground(.hidden)
+                    .frame(minHeight: 100).accessibilityLabel("Editable working transcript")
+                if draft.transcript.isEmpty && record.currentEvidenceSpans.isEmpty {
+                    Text("Import a local recording or write a transcript here.")
+                        .font(.system(size: 12)).foregroundStyle(secondary)
+                }
+                ForEach(visibleSpans) { span in
+                    transcriptPassage(span)
+                }
+                if !transcriptQuery.isEmpty && visibleSpans.isEmpty {
+                    Text("No transcript passages match this search.").foregroundStyle(secondary)
+                }
+            }
+            .frame(maxWidth: 700, alignment: .leading)
+            .padding(.horizontal, 14).padding(.bottom, 14)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+    }
+
+    private func transcriptPassage(_ span: PipMeetingEvidenceSpan) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(Self.time(span.start) + "–" + Self.time(span.end)).monospacedDigit()
+                if !span.speaker.isEmpty { Text(span.speaker) }
+            }
+            .font(.system(size: 11, weight: .medium)).foregroundStyle(secondary)
+            Text(span.text).font(.system(size: 14))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(11)
+        .background(panel, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var transcriptDrawerFooter: some View {
+        HStack {
+            Label(capture.phase == .recording ? "Recording" : capture.phase == .paused ? "Paused" : "Local transcript", systemImage: capture.phase == .recording ? "waveform" : "waveform")
+                .font(.system(size: 12)).foregroundStyle(secondary)
+            Spacer()
+            if capture.phase == .paused || capture.phase == .interrupted {
+                Button("Resume") { Task { await capture.resume(appState: appState) } }.disabled(capture.storageProblem)
+            }
+        }
+        .padding(13).overlay(alignment: .top) { Rectangle().fill(Color(nsColor: .separatorColor)).frame(height: 0.5) }
     }
 
     @discardableResult private func save() -> Bool {
