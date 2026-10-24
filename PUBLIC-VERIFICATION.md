@@ -2,9 +2,17 @@
 
 23 October 2026. **Experimental native macOS source.** File-fed local transcription and selected persistence/recovery paths have measured evidence. Native microphone/system recording and complete reference fidelity remain unaccepted.
 
-## Current source and local packages
+## Clean-export build inputs and local package checks
 
-The final local source input SHA256 is `2740b9fbdb1c9e204d437bdd541ea4317facd2610cce4969e20fefccfc09fc91`. All four product configurations passed118 selected Swift tests each, including compatible upstream audio/sidecar/crash recovery and local library/revision/draft/pending-ingestion/timeline tests. Tests used isolated synthetic stores. Four release packages passed source/identity/flag/receipt and strict ad-hoc signature checks. Fourteen Python package-integrity regressions and two pinned-speech-setup regressions passed separately.
+The exported Replica app build-input manifest is SHA-256 `a28ae66aeaaa80c27bed5b6dcafbdb052b33a1069d28b2265749d247ddd59851`; the shared engine input is `c3c68bb96387f3ea1a2d13aa6b3213360273e0d46a96ccc9523c819dfafe4cfb`. On this clean export, `scripts/test-native.sh baseline` completed 118 selected tests with 0 failures. `scripts/build-native.sh baseline` completed, and the resulting local ad-hoc signed package passed source/identity/receipt and strict signature verification. It is not notarised or included in this repository. The first package qualification also exposed a speech-setup quoting defect; that script was corrected and the final source export passes the hosted setup checks below.
+
+The shared release-integrity suite passed 14/14 focused Python tests on the clean Custom export. The two products contain byte-identical integrity and speech-setup test scripts. Hosted per-edition tests and packaging are reported below; successful source checks do not establish GUI, microphone, or full fidelity acceptance.
+
+## Hosted clean-export CI
+
+The public workflow uses read-only checkout permissions, macOS 26, the selected native regression lane, packaging, and AudioTap tests. [Initial Replica main run](https://github.com/Ghostzy0/pip-meetings-replica/actions/runs/40120726229) tested the published root source with build-input digest `a28ae66aeaaa80c27bed5b6dcafbdb052b33a1069d28b2265749d247ddd59851`. Both attempts failed in native regression compilation: `transcriptDrawer` exceeded the configured 300 ms type-check limit (303 ms in attempt 1; 349 ms in attempt 2). The speech-setup step passed; packaging and AudioTap verification were skipped. This was a reproducible source compile failure, not a pass.
+
+The current branch splits the transcript drawer into small view helpers without changing its child order, controls, actions, accessibility labels, or modifiers. Its current Replica app build-input digest is `527593ab66d5ec0cdf35d388cc4a4dd1a776b291f394a48f5a788d986cdd5d12`. The revised source has not yet been built locally; its pull-request CI run must pass before this compile issue is considered resolved.
 
 Verified host: Apple Silicon arm64, macOS27.0.1, Xcode27.1/Swift6.4. Intended source target is macOS14.2+ with Swift tools6.2+. Intel and other hosts remain unverified. Local packages are **ad-hoc signed, not Developer ID signed or notarised**. A local build does not establish native recording acceptance.
 
