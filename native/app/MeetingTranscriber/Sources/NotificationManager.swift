@@ -1,0 +1,365 @@
+import Foundation
+import os.log
+import UserNotifications
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "NotificationManager")
+
+/// Sends macOS notifications for meeting state transitions. Marked
+/// `@unchecked Sendable` because:
+/// - `UNUserNotificationCenter` is thread-safe per Apple's docs
+/// - `isSetUp` is written exactly once in `setUp()` (called from the
+///   `@main` scene) and read thereafter, so no real race
+/// `@MainActor` would be cleaner but conflicts with the
+/// `UNUserNotificationCenterDelegate` callbacks, which the framework
+/// invokes from arbitrary queues.
+final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, AppNotifying, @unchecked Sendable {
+    static let shared = NotificationManager()
+
+    private(set) var isSetUp = false
+
+    // MARK: - Browser meeting consent prompt (issue #503)
+
+    /// Notification category + action identifiers for the "record this browser
+    /// meeting?" prompt. The category is registered in `setUp()`; the action
+    /// identifier the user taps maps to an answer via `consentAnswer(for:)`.
+    static let consentCategoryID = "BROWSER_MEETING_CONSENT"
+    static let recordActionID = "BROWSER_MEETING_RECORD"
+    static let ignoreActionID = "BROWSER_MEETING_IGNORE"
+    static let neverActionID = "BROWSER_MEETING_NEVER"
+    /// How long an unanswered prompt stays open before it resolves itself as
+    /// `.expired`. Five minutes, not one: it no longer blocks anything (the
+    /// watch loop kept polling since issue #543), and a minute was only ever
+    /// enough for someone sitting at the screen. Independent of the
+    /// `BrowserConsentPolicy` cooldowns, which govern the NEXT question.
+    static let consentPromptTimeout: TimeInterval = 300
+
+    /// Owns the consent prompt's register/resolve/timeout/race logic (unit-tested
+    /// in `ConsentPromptCoordinatorTests`); this class only wires the
+    /// UNUserNotificationCenter add + delegate callback to it.
+    private let consentCoordinator = ConsentPromptCoordinator(timeout: NotificationManager.consentPromptTimeout)
+
+    #if !APPSTORE && !PIP_EDITION
+        /// Bounded in-memory log of every notification posted through
+        /// `notify(...)`, read by the dev-only debug RPC `/state.notifications`
+        /// snapshot (via the `AppNotifying.recentNotifications` conformance).
+        /// Gated out of the App Store variant, which has no RPC reader.
+        let recentNotificationsLog = NotificationRingBuffer()
+
+        var recentNotifications: [NotificationRingBuffer.Entry] {
+            recentNotificationsLog.entries
+        }
+    #endif
+
+    /// The notification center behind a port (so posting + registration are
+    /// testable against a fake) and the "can we deliver?" check (a real app
+    /// bundle is required — `Bundle.main.bundleIdentifier` is nil in `swift
+    /// test`). Both injected; production uses the real system center + the bundle
+    /// check, tests inject a fake scheduler and flip `canDeliver`.
+    private let scheduler: any NotificationScheduling
+    private let canDeliver: @Sendable () -> Bool
+    /// Where the posted / dropped / settings lines go. Injected so a test can
+    /// assert they are written, not only what they would say.
+    private let log: any DiagnosticsLogging
+
+    init(
+        scheduler: any NotificationScheduling = SystemNotificationScheduler(),
+        canDeliver: @escaping @Sendable () -> Bool = { Bundle.main.bundleIdentifier != nil },
+        log: any DiagnosticsLogging = OSLogDiagnostics(category: "NotificationManager"),
+    ) {
+        self.scheduler = scheduler
+        self.canDeliver = canDeliver
+        self.log = log
+        super.init()
+    }
+
+    /// Set up delegate and request permission. Must be called after the app bundle is loaded.
+    func setUp() {
+        guard !isSetUp else { return }
+        // UNUserNotificationCenter crashes without a proper app bundle.
+        guard canDeliver() else {
+            logger.warning("Skipping setup — notifications not deliverable")
+            return
+        }
+        isSetUp = true
+        scheduler.setDelegate(self)
+        scheduler.setCategories([Self.makeConsentCategory()])
+        scheduler.requestAuthorization()
+    }
+
+    func notify(title: String, body: String, urgency: NotificationUrgency) {
+        let deliverable = deliverableOrLogDrop()
+
+        #if !APPSTORE && !PIP_EDITION
+            // Record before the delivery guard so the app's *decision* to notify
+            // is captured even in headless/test contexts where
+            // `UNUserNotificationCenter` (which needs a real app bundle) is
+            // absent. The `posted` flag preserves that distinction, and claims
+            // nothing beyond it — whether anything was rendered is the
+            // `NotificationVisibility` question, not this one.
+            recentNotificationsLog.record(title: title, body: body, posted: deliverable)
+        #endif
+
+        guard deliverable else { return }
+
+        let id = UUID().uuidString
+        scheduler.add(UNNotificationRequest(
+            identifier: id,
+            content: Self.makeNotificationContent(title: title, body: body, urgency: urgency),
+            trigger: nil,
+        ))
+        logPosted(id: id, urgency: urgency)
+    }
+
+    /// Whether a notification can be handed to the notification centre now,
+    /// logging why not when it cannot. Before this a dropped notification left
+    /// no trace, so "the user saw nothing" could not be told apart from "the
+    /// app never asked". Both halves are read once, so the decision and the
+    /// logged reason come from the same snapshot. Nothing about the
+    /// notification itself is logged: a title can carry a meeting name.
+    private func deliverableOrLogDrop() -> Bool {
+        let setUp = isSetUp
+        let hasBundle = canDeliver()
+        guard setUp, hasBundle else {
+            let reason = Self.undeliverableReason(hasBundle: hasBundle)
+            log.warning("notification_dropped reason=\(reason)")
+            return false
+        }
+        return true
+    }
+
+    /// Why a notification could not be handed to the notification centre, for
+    /// a caller that already knows it could not. The missing bundle is named
+    /// first because `setUp()` refuses without one, so in that case "not set
+    /// up" would name the consequence rather than the cause.
+    static func undeliverableReason(hasBundle: Bool) -> String {
+        hasBundle ? "not_set_up" : "no_app_bundle"
+    }
+
+    /// Logs a request handed to the notification centre, under its id. A post
+    /// the system then refuses is logged by the scheduler as
+    /// `notification_post_failed` under the same id. At notice level for the
+    /// reason given on `OSLogDiagnostics`.
+    ///
+    /// Followed by a `notification_settings` line with this app's notification
+    /// settings: authorisation, the alert switch, the alert style, the Time
+    /// Sensitive switch and scheduled delivery. It is read right after posting,
+    /// in a task of its own, so it is matched to its post by id rather than by
+    /// order, and it may be missing if the app quits first. It narrows "posted
+    /// but never shown" to what those settings can explain, such as alerts off
+    /// or the style set to None. It does not settle it: nothing here says
+    /// whether a Focus was active, nor whether the running bundle carries the
+    /// time-sensitive entitlement, without which `.timeSensitive` silently
+    /// degrades to an ordinary banner (see `NotificationUrgency`). Read from the
+    /// scheduler directly, since the caller has already established that a
+    /// notification centre is there.
+    private func logPosted(id: String, urgency: NotificationUrgency) {
+        log.notice("notification_posted id=\(id) urgency=\(urgency.rawValue)")
+        let scheduler = scheduler
+        let log = log
+        Task {
+            let visibility = await scheduler.visibility()
+            log.notice("notification_settings id=\(id) \(visibility.logDescription)")
+        }
+    }
+
+    /// Pure builder for a notification's `UNMutableNotificationContent` (title,
+    /// body, sound, optional category, urgency). Split out so the content
+    /// mapping is unit-testable without a real notification center.
+    ///
+    /// `urgency` defaults to `.standard`, a banner that auto-dismisses and is
+    /// suppressed under Focus, which is right for anything the user can read
+    /// whenever they get round to it. `NotificationUrgency` is the app's whole
+    /// vocabulary here, so this is the only place a raw
+    /// `UNNotificationInterruptionLevel` is set.
+    static func makeNotificationContent(
+        title: String,
+        body: String,
+        categoryID: String? = nil,
+        urgency: NotificationUrgency = .standard,
+    ) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.interruptionLevel = urgency.interruptionLevel
+        if let categoryID { content.categoryIdentifier = categoryID }
+        return content
+    }
+
+    /// Pure function: determines notification content for a state transition.
+    /// Returns nil if no notification should be sent.
+    static func notificationContent(
+        for state: TranscriberState,
+        status: TranscriberStatus,
+    ) -> (title: String, body: String)? {
+        switch state {
+        case .recording:
+            let meetingTitle = status.meeting?.title ?? "Unknown"
+            let app = status.meeting?.app ?? ""
+            return ("Meeting Detected", "Recording: \(meetingTitle) (\(app))")
+
+        case .protocolReady:
+            let meetingTitle = status.meeting?.title ?? "Meeting"
+            return ("Protocol Ready", "Protocol for \"\(meetingTitle)\" is ready.")
+
+        case .waitingForSpeakerNames:
+            return ("Name Speakers", "Speakers detected — open the app to assign names")
+
+        case .error:
+            if let error = status.error {
+                return ("Transcriber Error", error)
+            }
+            return nil
+
+        default:
+            return nil
+        }
+    }
+
+    /// Handle state transitions and send appropriate notifications.
+    func handleTransition(
+        from _: TranscriberState?,
+        to newState: TranscriberState,
+        status: TranscriberStatus,
+    ) {
+        if let content = Self.notificationContent(for: newState, status: status) {
+            notify(title: content.title, body: content.body)
+        }
+    }
+
+    // MARK: - Consent prompt (issue #503)
+
+    /// The "record this browser meeting?" category with Record / Ignore actions.
+    static func makeConsentCategory() -> UNNotificationCategory {
+        // No `.foreground` on either action: the delegate callback fires
+        // whether or not the app is activated, so the flag adds nothing except
+        // yanking the user out of the meeting they just agreed to record. It
+        // also activates whichever bundle LaunchServices considers canonical
+        // for the identifier, which on a machine with several copies installed
+        // is not necessarily the one that asked.
+        let record = UNNotificationAction(identifier: recordActionID, title: "Record", options: [])
+        let ignore = UNNotificationAction(identifier: ignoreActionID, title: "Ignore", options: [])
+        // Never is what makes process-open detection tolerable: any app holding
+        // a WebRTC assertion can reach this prompt, so the user needs a way to
+        // retire one permanently rather than declining it every ten minutes.
+        let never = UNNotificationAction(identifier: neverActionID, title: "Never for this app", options: [])
+        return UNNotificationCategory(
+            identifier: consentCategoryID,
+            actions: [record, ignore, never],
+            intentIdentifiers: [],
+            options: [],
+        )
+    }
+
+    /// Pure mapping from the tapped action to an answer. Only the explicit
+    /// Record action grants consent; Never is its own durable answer; Ignore, a
+    /// swipe-away dismiss, the default body tap and anything unrecognised all
+    /// decline, so an unknown identifier can never start a recording.
+    static func consentAnswer(for actionIdentifier: String) -> ConsentAnswer {
+        switch actionIdentifier {
+        case recordActionID: .granted
+        case neverActionID: .never
+        default: .declined
+        }
+    }
+
+    /// Post an actionable "record this browser meeting?" prompt and await the
+    /// user's choice (issue #503). Returns `.declined` when notifications can't
+    /// be delivered (no bundle / not set up) so we never record without a
+    /// visible prompt, `.expired` when nobody answered in time.
+    @MainActor
+    func askToRecord(title: String, body: String) async -> ConsentAnswer {
+        let deliverable = deliverableOrLogDrop()
+
+        #if !APPSTORE && !PIP_EDITION
+            // Same contract as `notify(...)`, and for the same reason: record the
+            // app's DECISION to prompt before the delivery guard, so an RPC
+            // consumer can tell "never asked" from "asked and could not show it".
+            // Without this the consent prompt was the one notification that left
+            // no trace, which is precisely how an invisible prompt could keep the
+            // browser e2e lane green while the feature was dead for users.
+            recentNotificationsLog.record(title: title, body: body, posted: deliverable)
+        #endif
+
+        guard deliverable else { return .declined }
+        let id = UUID().uuidString
+        let answer = await consentCoordinator.awaitDecision(id: id) { [self] in
+            postConsentNotification(id: id, title: title, body: body)
+        }
+        // However it resolved — tapped, expired, or answered over RPC — the
+        // question is settled, so the prompt must not stay in Notification
+        // Center asking about a meeting that has moved on.
+        scheduler.removeDelivered(withIdentifiers: [id])
+        return answer
+    }
+
+    /// How a posted notification would be presented, for
+    /// `BrowserConsentReadiness`. Read live rather than cached from
+    /// `requestAuthorization`: the user can change any of it in System Settings
+    /// long after launch, and that silently disables browser-meeting recording.
+    @MainActor
+    func notificationVisibility() async -> NotificationVisibility {
+        // Same guard as `setUp` and `notify`: without a real app bundle the
+        // notification centre raises NSInternalInconsistencyException.
+        guard canDeliver() else { return .unread }
+        return await scheduler.visibility()
+    }
+
+    /// Resolve a parked browser-consent prompt programmatically (the debug-RPC
+    /// `confirmBrowserConsent` hook, issue #503) — an automated e2e driver can't
+    /// click the macOS notification, so it answers the parked prompt through
+    /// this instead. Returns whether a prompt was actually waiting. Touches only
+    /// the lock-guarded coordinator, so it's safe from any thread with no
+    /// MainActor hop (unlike the scene actions).
+    func resolveBrowserConsent(granted: Bool) -> Bool {
+        consentCoordinator.resolvePending(granted: granted)
+    }
+
+    /// Post the actionable consent notification (the request-building is the pure
+    /// `makeNotificationContent`; only the `scheduler.add` is I/O). The decision
+    /// itself is driven by `didReceive` / the coordinator timeout, whichever
+    /// resolves first.
+    private func postConsentNotification(id: String, title: String, body: String) {
+        // The one notification the app posts that asks a question with a
+        // deadline. At `.active` it is a banner: gone in seconds, and
+        // suppressed outright by any Focus mode, so it expires unseen and
+        // browser meetings silently never record. `.timeSensitive` is the
+        // only level that breaks through Focus, and it needs the matching
+        // entitlement to do so; see `NotificationUrgency.timeSensitive`.
+        let urgency = NotificationUrgency.timeSensitive
+        scheduler.add(UNNotificationRequest(
+            identifier: id,
+            content: Self.makeNotificationContent(
+                title: title, body: body, categoryID: Self.consentCategoryID, urgency: urgency,
+            ),
+            trigger: nil,
+        ))
+        logPosted(id: id, urgency: urgency)
+    }
+
+    /// Resolve a parked consent prompt from a notification response's primitives.
+    /// The delegate callback unwraps the framework `UNNotificationResponse` (which
+    /// has no public initialiser) into these, so the id + grant mapping stays
+    /// unit-testable without constructing a real response.
+    func resolveConsent(responseIdentifier: String, actionIdentifier: String) {
+        consentCoordinator.resolve(
+            id: responseIdentifier,
+            answer: Self.consentAnswer(for: actionIdentifier),
+        )
+    }
+
+    // Handle a tapped consent action (or a dismiss) → resolve the prompt.
+    // swiftlint:disable:next async_without_await
+    func userNotificationCenter(_: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        resolveConsent(
+            responseIdentifier: response.notification.request.identifier,
+            actionIdentifier: response.actionIdentifier,
+        )
+    }
+
+    // Show notifications even when app is in foreground
+    // swiftlint:disable:next async_without_await
+    func userNotificationCenter(_: UNUserNotificationCenter, willPresent _: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
+    }
+}

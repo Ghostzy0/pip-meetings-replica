@@ -1,0 +1,248 @@
+@testable import AudioTapLib
+import CoreAudio
+import XCTest
+
+/// `SilentTrackDiagnostics` owns the queue the process-state reads run on, the
+/// guard that keeps a wedged read from piling up, and the observer's state
+/// (issue #672). The reads themselves need hardware; everything around them is
+/// what this pins.
+final class SilentTrackDiagnosticsTests: XCTestCase {
+    private let processes = [TappedProcess(pid: 1, audioObjectID: 11)]
+
+    /// Records probe calls and lets a test hold one open, which is how the
+    /// wedged-read case is reproduced without a wedged HAL.
+    private final class ProbeSpy: @unchecked Sendable {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var _calls = 0
+        var calls: Int {
+            lock.lock(); defer { lock.unlock() }
+            return _calls
+        }
+
+        func probe(hold: Bool) -> SilentTrackDiagnostics.Probe {
+            { [self] _, _ in
+                lock.lock(); _calls += 1; lock.unlock()
+                entered.signal()
+                if hold { release.wait() }
+                return SilentTrackDiagnostics.ProbeSnapshot(processes: [], device: nil)
+            }
+        }
+    }
+
+    // MARK: - The guard
+
+    func testASecondProbeIsRefusedWhileTheFirstIsStillRunning() {
+        let spy = ProbeSpy()
+        let diagnostics = SilentTrackDiagnostics(probe: spy.probe(hold: true)) { _, _ in }
+
+        XCTAssertTrue(diagnostics.probeAsync(processes, aggregateID: 0, reason: "first"))
+        XCTAssertEqual(spy.entered.wait(timeout: .now() + 2), .success, "the first probe started")
+
+        // A HAL read that never comes back must cost one parked thread, not a
+        // growing queue of them. This is the whole reason the guard exists.
+        XCTAssertFalse(diagnostics.probeAsync(processes, aggregateID: 0, reason: "second"))
+        XCTAssertFalse(diagnostics.probeAsync(processes, aggregateID: 0, reason: "third"))
+
+        spy.release.signal()
+        XCTAssertEqual(spy.calls, 1)
+    }
+
+    /// The watchdog's deadline for a rebuilt tap needs no HAL access, and it
+    /// must not wait behind one that does: the start probe for the very tap it
+    /// guards is queued on the diagnostics queue, and a read wedged there
+    /// (issue #588) would otherwise keep the rebuild open as long as the read.
+    func testAWatchdogDeadlineIsNotHeldBehindAWedgedRead() {
+        let spy = ProbeSpy()
+        let diagnostics = SilentTrackDiagnostics(probe: spy.probe(hold: true)) { _, _ in }
+        defer { spy.release.signal() }
+        XCTAssertTrue(diagnostics.probeAsync(processes, aggregateID: 0, reason: "wedged"))
+        XCTAssertEqual(spy.entered.wait(timeout: .now() + 2), .success, "precondition: the read is in progress")
+
+        let fired = expectation(description: "the deadline ran")
+        diagnostics.scheduleWatchdogDeadline(after: 0.05) { fired.fulfill() }
+
+        wait(for: [fired], timeout: 2)
+    }
+
+    func testAProbeCanRunAgainOnceTheFirstReturned() {
+        // The sink is the only word a caller gets that a read has returned, so
+        // the guard must already be open when it fires: whoever the sink wakes
+        // starts the next probe straight away, with no waiting and no retry.
+        // The sink is held open while the test asks, so what is asserted is the
+        // guard's state at the moment the sink fires, not who wins a race
+        // against the block returning. Waking from the sink and then asking
+        // won that race every time even with the clear after the sink, so that
+        // shape pins nothing; this one is refused every time under that order.
+        let spy = ProbeSpy()
+        let firstReported = DispatchSemaphore(value: 0)
+        let secondRequested = DispatchSemaphore(value: 0)
+        let secondReported = DispatchSemaphore(value: 0)
+        let diagnostics = SilentTrackDiagnostics(probe: spy.probe(hold: false)) { reason, outcome in
+            guard case .read = outcome else { return }
+            if reason == "first" {
+                firstReported.signal()
+                secondRequested.wait()
+            } else {
+                secondReported.signal()
+            }
+        }
+
+        XCTAssertTrue(diagnostics.probeAsync(processes, aggregateID: 0, reason: "first"))
+        XCTAssertEqual(firstReported.wait(timeout: .now() + 5), .success, "the first read reached the sink")
+        let restarted = diagnostics.probeAsync(processes, aggregateID: 0, reason: "second")
+        secondRequested.signal()
+        XCTAssertTrue(restarted, "the guard must be open by the time the sink reports the read")
+        guard restarted else { return }
+        XCTAssertEqual(secondReported.wait(timeout: .now() + 5), .success, "the second read reached the sink")
+        XCTAssertEqual(spy.calls, 2)
+    }
+
+    func testTheReasonReachesTheSink() {
+        // Asserted inside the sink rather than through a box: the sink is
+        // `@Sendable`, so anything it writes back out would need its own lock
+        // for one string.
+        let reported = expectation(description: "reported")
+        let diagnostics = SilentTrackDiagnostics(probe: { _, _ in .init(processes: [], device: nil) }, sink: { reason, _ in
+            XCTAssertEqual(reason, "stop")
+            reported.fulfill()
+        })
+        diagnostics.probeAsync(processes, aggregateID: 0, reason: "stop")
+        wait(for: [reported], timeout: 5)
+    }
+
+    func testARefusedProbeIsReportedRatherThanSwallowed() {
+        // A skip means an earlier read has not come back. If that one is wedged,
+        // every later probe is skipped for the rest of the recording, and a
+        // silent skip would leave a log that is simply missing, with nothing
+        // saying why.
+        let spy = ProbeSpy()
+        let skipped = expectation(description: "skip reported")
+        let diagnostics = SilentTrackDiagnostics(probe: spy.probe(hold: true)) { reason, outcome in
+            guard outcome == .skipped else { return }
+            XCTAssertEqual(reason, "second")
+            skipped.fulfill()
+        }
+        XCTAssertTrue(diagnostics.probeAsync(processes, aggregateID: 0, reason: "first"))
+        XCTAssertEqual(spy.entered.wait(timeout: .now() + 2), .success)
+        XCTAssertFalse(diagnostics.probeAsync(processes, aggregateID: 0, reason: "second"))
+        wait(for: [skipped], timeout: 5)
+        spy.release.signal()
+    }
+
+    func testAProbeStillReportsAfterItsOwnerIsReleased() {
+        // The stop reading is requested from AppAudioCapture.stop(), and
+        // AudioCaptureSession releases the capture object a few statements
+        // later, which releases this one with it. Under a weak capture the
+        // queue found nothing left and the stop reading was lost almost every
+        // time, which is the one reading the whole feature exists to produce.
+        //
+        // The release below wins the race against the queue by a wide margin
+        // (an async dispatch costs microseconds, the next statement does not),
+        // so under the defect this times out rather than flaking green.
+        let reported = expectation(description: "reported after release")
+        var diagnostics: SilentTrackDiagnostics? = SilentTrackDiagnostics(
+            probe: { _, _ in .init(processes: [], device: nil) }, sink: { _, _ in reported.fulfill() },
+        )
+        diagnostics?.probeAsync(processes, aggregateID: 0, reason: "stop")
+        diagnostics = nil
+        wait(for: [reported], timeout: 5)
+    }
+
+    // MARK: - What the stop summary reads
+
+    func testTheRememberedProcessesSurviveASessionThatIsAlreadyGone() {
+        // .stopAndRetry clears the tap session before any restart attempt
+        // launches, and only adoption puts one back. So on every give-up and
+        // mid-restart stop the session is nil, which is exactly the recording
+        // whose process state is worth having.
+        let diagnostics = SilentTrackDiagnostics(probe: { _, _ in .init(processes: [], device: nil) }, sink: { _, _ in })
+        XCTAssertTrue(diagnostics.lastInstalledProcesses.isEmpty)
+        diagnostics.remember(processes, aggregateID: 0)
+        XCTAssertEqual(diagnostics.lastInstalledProcesses, processes)
+    }
+
+    func testAnEmptyProcessListStillReports() {
+        // A session built by a test seam has no tapped processes. The stop line
+        // must still be written, saying so, rather than vanishing.
+        let reported = expectation(description: "reported")
+        let diagnostics = SilentTrackDiagnostics(probe: SilentTrackDiagnostics.readAll) { _, outcome in
+            XCTAssertEqual(outcome, .read(.init(processes: [], device: nil)))
+            reported.fulfill()
+        }
+        XCTAssertTrue(diagnostics.probeAsync([], aggregateID: 0, reason: "start"))
+        wait(for: [reported], timeout: 5)
+    }
+
+    // MARK: - The device half of the snapshot
+
+    func testTheShippingProbeAsksAboutTheAggregateWhenThereIsOne() {
+        // The decision in `readAll`: a probe taken while a tap is installed has
+        // an aggregate to report on, and the line that says whether it ever
+        // started is the reason this snapshot carries a device at all. The
+        // readings themselves fail against an id no device owns, which is fine
+        // and is the point: a failed reading is still a reading.
+        let reported = expectation(description: "reported")
+        let diagnostics = SilentTrackDiagnostics(probe: SilentTrackDiagnostics.readAll) { _, outcome in
+            guard case let .read(snapshot) = outcome else { return XCTFail("expected a reading") }
+            XCTAssertNotNil(snapshot.device, "a probe with an aggregate must report on it")
+            reported.fulfill()
+        }
+        XCTAssertTrue(diagnostics.probeAsync([], aggregateID: 1, reason: "start"))
+        wait(for: [reported], timeout: 5)
+    }
+
+    func testTheShippingProbeAsksNothingWhenNoTapIsInstalled() {
+        // The other side, and the reason the field is optional: between a
+        // give-up and the next adoption there is no aggregate, and inventing a
+        // reading for object 0 would put a line in the log about a device that
+        // was never part of this recording.
+        let reported = expectation(description: "reported")
+        let diagnostics = SilentTrackDiagnostics(probe: SilentTrackDiagnostics.readAll) { _, outcome in
+            guard case let .read(snapshot) = outcome else { return XCTFail("expected a reading") }
+            XCTAssertNil(snapshot.device)
+            reported.fulfill()
+        }
+        XCTAssertTrue(
+            diagnostics.probeAsync([], aggregateID: AudioObjectID(kAudioObjectUnknown), reason: "stop"),
+        )
+        wait(for: [reported], timeout: 5)
+    }
+
+    @available(macOS 14.2, *)
+    func testTheSinkRendersADeviceReadingWithoutTappedProcesses() {
+        // A tap with no processes still has an aggregate, and the device line
+        // has to survive the empty-process early return that follows it.
+        // Exercises the branch; the log text itself is not observable here, for
+        // the same reason the process lines beside it are not.
+        AppAudioCapture.logSilentTrackProbe("start", .read(.init(
+            processes: [],
+            device: AggregateRunState(
+                aggregateID: 211, isRunning: .value(false),
+                defaultOutputDeviceID: .value(145), defaultOutputRate: .value(24000),
+            ),
+        )))
+    }
+
+    // MARK: - The observer behind it
+
+    func testTheEdgeIsHandedBackToTheCaller() {
+        let diagnostics = SilentTrackDiagnostics(probe: { _, _ in .init(processes: [], device: nil) }, sink: { _, _ in })
+        XCTAssertNil(diagnostics.observe(ages(energy: 0.5)))
+        XCTAssertEqual(
+            diagnostics.observe(ages(energy: 11.0)),
+            .enteredZeroRun(afterSignalSeconds: 11.0),
+        )
+    }
+
+    func testTheCountersSurviveForTheStopSummary() {
+        let diagnostics = SilentTrackDiagnostics(probe: { _, _ in .init(processes: [], device: nil) }, sink: { _, _ in })
+        _ = diagnostics.observe(ages(energy: 30.0))
+        _ = diagnostics.observe(ages(energy: 0.02))
+        _ = diagnostics.observe(ages(energy: 12.0))
+        let counters = diagnostics.counters
+        XCTAssertEqual(counters.zeroRuns, 2)
+        XCTAssertEqual(counters.longestZeroRun, 30.0)
+    }
+}

@@ -1,0 +1,1 @@
+Describe the problem and resulting behavior. Include a small synthetic reproduction and actual test/build commands/results. State remaining native gaps. Preserve code/model notices and never include private audio, accounts, model caches or generated builds.

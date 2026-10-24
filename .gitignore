@@ -1,0 +1,9 @@
+native/.build*/
+native/.test*/
+native/app/MeetingTranscriber/.build/
+native/tools/audiotap/.build/
+dist/
+
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,721 @@
+// swiftlint:disable file_length
+//
+// A settings registry grows by one documented property per feature, so the
+// 600-line cap measures how many features the app has rather than whether this
+// file does too much. Suppressed rather than split because the honest split is
+// to move the three enums below into their own file, and two open pull requests
+// are editing this one; that move is worth doing on a quiet tree, not folded
+// into a feature branch.
+import SwiftUI
+
+// SwiftFormat strips redundant raw values matching their case name, which then
+// trips SwiftLint's `raw_value_for_camel_cased_codable_enum`; the rawValues
+// already match (the rule is a stability hint, not a behavioral requirement),
+// so disable the lint here rather than fight the formatter.
+enum TranscriptionEngineSetting: String, CaseIterable, Codable {
+    // swiftlint:disable:next raw_value_for_camel_cased_codable_enum
+    case whisperKit
+    case parakeet
+
+    var label: String {
+        switch self {
+        case .whisperKit: "WhisperKit (Whisper)"
+        case .parakeet: "Parakeet TDT v3 (NVIDIA)"
+        }
+    }
+
+    /// Whether this engine is available on the current platform. Both current
+    /// engines run everywhere the app does; kept as a capability hook for
+    /// engines with stricter OS floors.
+    var isAvailable: Bool {
+        switch self {
+        case .whisperKit, .parakeet: true
+        }
+    }
+
+    /// Cases available on the current platform. Used in UI pickers instead of allCases.
+    static var availableCases: [Self] {
+        allCases.filter(\.isAvailable)
+    }
+
+    /// Whether the engine implements `transcribeSamples([Float])` so the
+    /// live-transcription pipeline can feed it VAD-bounded windows. Both current
+    /// engines do; kept as an exhaustive `switch` (not a stored `true`) so a
+    /// future non-streaming engine is forced to declare its support here.
+    var supportsLiveTranscription: Bool {
+        switch self {
+        case .whisperKit, .parakeet: true
+        }
+    }
+}
+
+enum DiarizerMode: String, CaseIterable, Codable {
+    // RawValues are implicit (= case name). Future case renames must
+    // either keep the rawValue stable (`case foo = "offline"`) or add a
+    // migration step — `AppSettingsTests.testDiarizerModeRawValuesPinJSONShape`
+    // is the regression gate that surfaces the need.
+    case offline
+    case sortformer
+
+    var label: String {
+        switch self {
+        case .offline: "Offline (Clustering)"
+        case .sortformer: "Sortformer (Overlap-aware)"
+        }
+    }
+
+    /// Maximum selectable speaker count for this mode. Sortformer's cap
+    /// is a hard architectural limit (`SortformerConfig.numSpeakers = 4`
+    /// in FluidAudio). Offline's cap is the upper bound of the Settings
+    /// Stepper — the diarizer has no hard limit, but anything above 10
+    /// is past the useful range for typical meetings. Surfaced as a
+    /// single source of truth so the Stepper ranges in Settings + the
+    /// SpeakerNamingView re-run UI + the cap-hint label all agree.
+    var speakerCap: Int {
+        switch self {
+        case .offline: 10
+        case .sortformer: 4
+        }
+    }
+}
+
+enum ProtocolProvider: String, CaseIterable {
+    #if !APPSTORE && !PIP_EDITION
+        case claudeCLI
+    #endif
+    case openAICompatible
+    case none // swiftlint:disable:this discouraged_none_name
+
+    var label: String {
+        switch self {
+        #if !APPSTORE && !PIP_EDITION
+            case .claudeCLI: "Claude CLI"
+        #endif
+
+        case .openAICompatible: "OpenAI-Compatible API"
+
+        case .none: "None (Transcript Only)"
+        }
+    }
+}
+
+@Observable
+final class AppSettings {
+    /// Backing store. Production callers pass nothing → `.standard`. Tests
+    /// inject their own `UserDefaults(suiteName:)` so parallel test
+    /// processes don't race on the shared on-disk plist.
+    @ObservationIgnored private let defaults: UserDefaults
+
+    /// Keychain account backing `openAIAPIKey`. Production callers pass
+    /// nothing → the real account. Tests inject a unique account so they never
+    /// touch the key the user configured in the app: the Keychain is scoped
+    /// per user, not per process, and the production item belongs to the app's
+    /// code signature, so a test binary reading it raises an authorization
+    /// prompt that blocks the run.
+    @ObservationIgnored private let apiKeyAccount: String
+
+    /// Keychain account backing `claudeAPIKey`, same injection reasoning as
+    /// `apiKeyAccount` above. Deliberately its own account name, distinct
+    /// from any Keychain item an external tool on the same machine might
+    /// use for its own Anthropic key — the user opts a key into this app
+    /// specifically, rather than reusing a credential another tool manages.
+    @ObservationIgnored private let claudeAPIKeyAccount: String
+
+    // MARK: - Apps to Watch
+
+    var watchTeams: Bool {
+        didSet { defaults.set(watchTeams, forKey: "watchTeams") }
+    }
+
+    var watchZoom: Bool {
+        didSet { defaults.set(watchZoom, forKey: "watchZoom") }
+    }
+
+    var watchWebex: Bool {
+        didSet { defaults.set(watchWebex, forKey: "watchWebex") }
+    }
+
+    /// Watch for browser-based meetings (Chromium browsers / WebRTC), issue #503.
+    /// Off by default — opt-in, and browser meetings prompt before recording
+    /// (the WebRTC signal isn't meeting-exclusive), unlike native auto-start.
+    var watchBrowserMeetings: Bool {
+        didSet { defaults.set(watchBrowserMeetings, forKey: "watchBrowserMeetings") }
+    }
+
+    /// Apps the user answered "Never for this app" about on a browser-meeting
+    /// consent prompt (see `ConsentDenyList`). Starts empty: there is nothing
+    /// to seed, because an app the user has approved is treated exactly like one
+    /// never seen (both still get the per-meeting prompt), so only refusals are
+    /// worth persisting.
+    var consentDeniedApps: [String] {
+        didSet { defaults.set(consentDeniedApps, forKey: "consentDeniedApps") }
+    }
+
+    /// Mic-input-detected call apps (see `MicInputDetector`). Off by default —
+    /// additive opt-in so existing installs see no new auto-recording behavior.
+    var watchWeChat: Bool {
+        didSet { defaults.set(watchWeChat, forKey: "watchWeChat") }
+    }
+
+    var watchTencentMeeting: Bool {
+        didSet { defaults.set(watchTencentMeeting, forKey: "watchTencentMeeting") }
+    }
+
+    var watchFaceTime: Bool {
+        didSet { defaults.set(watchFaceTime, forKey: "watchFaceTime") }
+    }
+
+    var watchWhatsApp: Bool {
+        didSet { defaults.set(watchWhatsApp, forKey: "watchWhatsApp") }
+    }
+
+    var watchCustomApps: [String] {
+        didSet { defaults.set(watchCustomApps, forKey: "watchCustomApps") }
+    }
+
+    /// Auto-start watching on app launch.
+    var autoWatch: Bool {
+        didSet { defaults.set(autoWatch, forKey: "autoWatch") }
+    }
+
+    // MARK: - Recording
+
+    var pollInterval: Double {
+        didSet {
+            if pollInterval < 1.0 { pollInterval = 1.0 }
+            defaults.set(pollInterval, forKey: "pollInterval")
+        }
+    }
+
+    var endGrace: Double {
+        didSet {
+            if endGrace < 1.0 { endGrace = 1.0 }
+            defaults.set(endGrace, forKey: "endGrace")
+        }
+    }
+
+    var noMic: Bool {
+        didSet { defaults.set(noMic, forKey: "noMic") }
+    }
+
+    /// When true, skip the entire post-recording pipeline (VAD, transcription,
+    /// diarization, protocol generation) and write a `<slug>_meta.json` sidecar
+    /// next to the WAVs for an external pipeline to consume.
+    var recordOnly: Bool {
+        didSet { defaults.set(recordOnly, forKey: "recordOnly") }
+    }
+
+    /// CoreAudio device UID for mic selection. Empty string = system default.
+    var micDeviceUID: String {
+        didSet { defaults.set(micDeviceUID, forKey: "micDeviceUID") }
+    }
+
+    /// Switch for the per-channel menu-bar tint, and for nothing else. The
+    /// ~10 Hz poller runs while recording either way, because the capture-failure
+    /// notifications it feeds must not depend on a preference about an icon.
+    /// Default: on.
+    var perChannelIndicatorEnabled: Bool {
+        didSet { defaults.set(perChannelIndicatorEnabled, forKey: "perChannelIndicatorEnabled") }
+    }
+
+    /// Rebuild the app-audio tap when its track has sat at exact zeros for a
+    /// minute while the meeting app still reports audio output (issue #672).
+    /// Default: off. Whether a rebuild restores a tap that went silent is
+    /// unmeasured, each rebuild costs a moment of audio and is exposed to the
+    /// restart wedge of issue #588, and a far end that is genuinely silent can
+    /// trip it. Read when a recording starts, like the other capture options.
+    var silentTrackWatchdogEnabled: Bool {
+        didSet { defaults.set(silentTrackWatchdogEnabled, forKey: "silentTrackWatchdogEnabled") }
+    }
+
+    /// PoC: when on, mic-channel audio is also fed to a live `StreamingTranscriber`
+    /// during recording. Partial / finalised captions are logged via os_log on
+    /// subsystem `com.meetingtranscriber`, category `LiveTranscription` — no
+    /// caption-bar UI yet. Only effective when the active engine is Parakeet;
+    /// other engines silently no-op. Default: off.
+    var liveTranscriptionEnabled: Bool {
+        didSet { defaults.set(liveTranscriptionEnabled, forKey: "liveTranscriptionEnabled") }
+    }
+
+    /// Overlay-window visibility only. Live transcription still runs when the
+    /// master toggle is on; this setting only hides `LiveCaptionsOverlay`.
+    /// Default on, so existing users keep seeing the bar. Missing UserDefaults
+    /// key reads as true (`defaults.object(forKey:) as? Bool ?? true`).
+    var liveCaptionsOverlayEnabled: Bool {
+        didSet { defaults.set(liveCaptionsOverlayEnabled, forKey: "liveCaptionsOverlayEnabled") }
+    }
+
+    /// Size preset of the caption bar (font + panel, see `LiveCaptionsSize`).
+    /// Default `.medium` is the pre-preset geometry, so an upgrade changes
+    /// nothing; an unknown stored value also reads as `.medium`.
+    var liveCaptionsSize: LiveCaptionsSize {
+        didSet { defaults.set(liveCaptionsSize.rawValue, forKey: "liveCaptionsSize") }
+    }
+
+    /// Seconds of continuous asymmetric silence before the indicator + notification
+    /// fire. Clamped to [30, 300] on write — short enough to surface a dead channel
+    /// inside a meeting, long enough not to trigger on normal speaking pauses.
+    var asymmetricSilenceWarningSeconds: Double {
+        didSet {
+            // Conditional reassignment to avoid infinite didSet recursion under @Observable.
+            if asymmetricSilenceWarningSeconds < 30 {
+                asymmetricSilenceWarningSeconds = 30
+            } else if asymmetricSilenceWarningSeconds > 300 {
+                asymmetricSilenceWarningSeconds = 300
+            }
+            defaults.set(asymmetricSilenceWarningSeconds, forKey: "asymmetricSilenceWarningSeconds")
+        }
+    }
+
+    /// Label for the local mic speaker in dual-source mode.
+    /// Default "Me". Empty string = diarize mic track (multi-person room).
+    var micName: String {
+        didSet { defaults.set(micName, forKey: "micName") }
+    }
+
+    // MARK: - Transcription
+
+    var transcriptionEngine: TranscriptionEngineSetting {
+        didSet { defaults.set(transcriptionEngine.rawValue, forKey: "transcriptionEngine") }
+    }
+
+    var whisperKitModel: String {
+        didSet { defaults.set(whisperKitModel, forKey: "whisperKitModel") }
+    }
+
+    /// Whisper transcription language. Empty string = auto-detect (maps to nil on WhisperKitEngine).
+    var whisperLanguage: String {
+        didSet { defaults.set(whisperLanguage, forKey: "whisperLanguage") }
+    }
+
+    /// Parakeet language hint (ISO 639-1 code). Empty string = auto-detect.
+    /// FluidAudio's v3 TDT decoder uses this for script-aware token filtering;
+    /// auto-detect can drift Cyrillic ↔ Latin on multi-script audio.
+    /// Default is empty (auto-detect): FluidAudio's auto-ID works well on
+    /// monolingual audio, unlike `whisperLanguage="de"` which had to be a
+    /// concrete default for historical reasons (and hurt non-DE users in #256).
+    var parakeetLanguage: String {
+        didSet { defaults.set(parakeetLanguage, forKey: "parakeetLanguage") }
+    }
+
+    private(set) var customVocabularyPath: String {
+        didSet { defaults.set(customVocabularyPath, forKey: "customVocabularyPath") }
+    }
+
+    private(set) var customVocabularyBookmark: Data? {
+        didSet { defaults.set(customVocabularyBookmark, forKey: "customVocabularyBookmark") }
+    }
+
+    /// Experimental opt-in: WhisperKit's prompt can reduce transcript completeness.
+    var whisperKitVocabularyPromptEnabled: Bool {
+        didSet { defaults.set(whisperKitVocabularyPromptEnabled, forKey: "whisperKitVocabularyPromptEnabled") }
+    }
+
+    func updateCustomVocabularySelection(path: String, bookmark: Data?) {
+        customVocabularyPath = path
+        customVocabularyBookmark = bookmark
+    }
+
+    var terminologyRulesText: String {
+        didSet {
+            defaults.set(terminologyRulesText, forKey: "terminologyRulesText")
+            terminologyRulesValidation = TerminologyNormalizer(rulesText: terminologyRulesText).diagnostics
+        }
+    }
+
+    var terminologyRulesValidation: TerminologyNormalizer.Diagnostics
+
+    /// Ephemeral UI status; recalculated when the selected vocabulary changes.
+    var customVocabularyValidation: CustomVocabularyValidation
+
+    var diarize: Bool {
+        didSet { defaults.set(diarize, forKey: "diarize") }
+    }
+
+    var vadEnabled: Bool {
+        didSet { defaults.set(vadEnabled, forKey: "vadEnabled") }
+    }
+
+    var vadThreshold: Float {
+        didSet { defaults.set(vadThreshold, forKey: "vadThreshold") }
+    }
+
+    /// Remove the far end from the microphone audio before transcription
+    /// (`EchoRemedy.cancellation`). Off by default: it has been measured on an
+    /// archive with synthetic loudspeaker echo, never in the field, and it wins
+    /// over the transcript dedup wherever both are on.
+    var echoCancellationEnabled: Bool {
+        didSet { defaults.set(echoCancellationEnabled, forKey: "echoCancellationEnabled") }
+    }
+
+    /// Leave the far end out of the transcript when the microphone only picked
+    /// it up from the loudspeaker.
+    ///
+    /// Off by default, deliberately, and not because the repair is optional:
+    /// duplicated remote speech is wrong output, so repairing it is the state
+    /// this should end up in. It ships off because the thresholds it decides by
+    /// come from a single recording, and no one has yet watched the repair work
+    /// on a real call — this same feature once passed every gate while doing
+    /// nothing in the field, which is exactly the failure a default of on would
+    /// hide.
+    ///
+    /// Since measured, and the answer was not the one that was hoped for: under
+    /// the alignment production actually uses, a local speaker who only ever
+    /// speaks while the far end does is taken for the echo and dropped
+    /// (`EchoSegmentClassifierTests` pins it as an expected failure). The
+    /// default is therefore no longer waiting on a measurement, it is waiting
+    /// on a repair, and the repair the project took is the acoustic
+    /// cancellation a layer up rather than a better threshold here.
+    var echoDedupEnabled: Bool {
+        didSet { defaults.set(echoDedupEnabled, forKey: "echoDedupEnabled") }
+    }
+
+    var diarizerMode: DiarizerMode {
+        didSet { defaults.set(diarizerMode.rawValue, forKey: "diarizerMode") }
+    }
+
+    /// Number of expected speakers. 0 = auto-detect.
+    var numSpeakers: Int {
+        didSet {
+            if numSpeakers < 0 { numSpeakers = 0 }
+            defaults.set(numSpeakers, forKey: "numSpeakers")
+        }
+    }
+
+    // MARK: - Experimental: Diarization Tuning
+
+    /// Defaults mirroring `OfflineDiarizerConfig.Clustering.community` and `Embedding.community`.
+    /// Source of truth for both `resetDiarizerTuning()` and tests.
+    enum DiarizerTuningDefaults {
+        static let clusterThreshold: Double = 0.6
+        static let warmStartFa: Double = 0.07
+        static let warmStartFb: Double = 0.8
+        static let minSegmentDurationSeconds: Double = 1.0
+        static let excludeOverlap: Bool = true
+    }
+
+    /// Euclidean distance threshold for unit-normalized embeddings (FluidAudio: clustering.threshold).
+    var clusterThreshold: Double {
+        didSet { defaults.set(clusterThreshold, forKey: "diarizerClusterThreshold") }
+    }
+
+    /// VBx warm-start Fa parameter — controls precision (FluidAudio: clustering.warmStartFa).
+    var warmStartFa: Double {
+        didSet { defaults.set(warmStartFa, forKey: "diarizerWarmStartFa") }
+    }
+
+    /// VBx warm-start Fb parameter — controls recall (FluidAudio: clustering.warmStartFb).
+    var warmStartFb: Double {
+        didSet { defaults.set(warmStartFb, forKey: "diarizerWarmStartFb") }
+    }
+
+    /// Skip embeddings for segments shorter than this duration (FluidAudio: embedding.minSegmentDurationSeconds).
+    var minSegmentDurationSeconds: Double {
+        didSet { defaults.set(minSegmentDurationSeconds, forKey: "diarizerMinSegmentDuration") }
+    }
+
+    /// Mask out frames where multiple speakers overlap during embedding extraction
+    /// (FluidAudio: embedding.excludeOverlap).
+    var excludeOverlap: Bool {
+        didSet { defaults.set(excludeOverlap, forKey: "diarizerExcludeOverlap") }
+    }
+
+    /// Reset all 5 experimental diarization tuning knobs to their FluidAudio community defaults.
+    func resetDiarizerTuning() {
+        clusterThreshold = DiarizerTuningDefaults.clusterThreshold
+        warmStartFa = DiarizerTuningDefaults.warmStartFa
+        warmStartFb = DiarizerTuningDefaults.warmStartFb
+        minSegmentDurationSeconds = DiarizerTuningDefaults.minSegmentDurationSeconds
+        excludeOverlap = DiarizerTuningDefaults.excludeOverlap
+    }
+
+    /// True when all 5 tuning knobs are at their default values.
+    var diarizerTuningIsAllDefaults: Bool {
+        clusterThreshold == DiarizerTuningDefaults.clusterThreshold
+            && warmStartFa == DiarizerTuningDefaults.warmStartFa
+            && warmStartFb == DiarizerTuningDefaults.warmStartFb
+            && minSegmentDurationSeconds == DiarizerTuningDefaults.minSegmentDurationSeconds
+            && excludeOverlap == DiarizerTuningDefaults.excludeOverlap
+    }
+
+    // MARK: - Protocol Generation
+
+    var protocolProvider: ProtocolProvider {
+        didSet { defaults.set(protocolProvider.rawValue, forKey: "protocolProvider") }
+    }
+
+    var protocolLanguage: String {
+        didSet { defaults.set(protocolLanguage, forKey: "protocolLanguage") }
+    }
+
+    /// Append the verbatim transcript to generated Markdown meeting minutes.
+    /// Defaults to `true` to preserve the output format used before this option
+    /// was introduced.
+    var includeFullTranscriptInProtocol: Bool {
+        didSet { defaults.set(includeFullTranscriptInProtocol, forKey: "includeFullTranscriptInProtocol") }
+    }
+
+    /// Keep the raw transcript as a separate `.txt` artefact after processing.
+    /// It remains while needed and is removed only after success with a saved protocol.
+    var saveRawTranscriptSeparately: Bool {
+        didSet { defaults.set(saveRawTranscriptSeparately, forKey: "saveRawTranscriptSeparately") }
+    }
+
+    static let protocolLanguages = [
+        "German", "English", "French", "Spanish", "Italian",
+        "Dutch", "Portuguese", "Japanese", "Chinese", "Korean",
+        "Russian", "Arabic", "Turkish", "Hindi", "Swedish",
+        "Danish", "Finnish", "Polish", "Czech", "Greek",
+        "Hungarian", "Romanian",
+    ]
+
+    #if !APPSTORE && !PIP_EDITION
+        var claudeBin: String {
+            didSet { defaults.set(claudeBin, forKey: "claudeBin") }
+        }
+    #endif
+
+    /// Default OpenAI-compatible endpoint — Ollama's base URL. Both the base
+    /// form (`.../v1`) and a full chat-completions URL are accepted on read
+    /// (see `OpenAIProtocolGenerator.apiBaseURL`); the base form is canonical.
+    static let defaultOpenAIEndpoint = "http://localhost:11434/v1"
+
+    var openAIEndpoint: String {
+        didSet { defaults.set(openAIEndpoint, forKey: "openAIEndpoint") }
+    }
+
+    var openAIModel: String {
+        didSet { defaults.set(openAIModel, forKey: "openAIModel") }
+    }
+
+    var openAIAPIKey: String {
+        get { KeychainHelper.read(key: apiKeyAccount) ?? "" }
+        set {
+            if newValue.isEmpty {
+                KeychainHelper.delete(key: apiKeyAccount)
+            } else {
+                KeychainHelper.save(key: apiKeyAccount, value: newValue)
+            }
+        }
+    }
+
+    #if !APPSTORE && !PIP_EDITION
+        /// API key for the Claude CLI protocol generator, entered by the user
+        /// in Settings → Protocol Generation. Empty means use the CLI's own
+        /// `claude login` session; this is never populated automatically.
+        var claudeAPIKey: String {
+            get { KeychainHelper.read(key: claudeAPIKeyAccount) ?? "" }
+            set {
+                if newValue.isEmpty {
+                    KeychainHelper.delete(key: claudeAPIKeyAccount)
+                } else {
+                    KeychainHelper.save(key: claudeAPIKeyAccount, value: newValue)
+                }
+            }
+        }
+    #endif
+
+    // MARK: - Output Directory
+
+    /// Security-scoped output-dir bookmark. Stored so `@Observable` can track it.
+    /// Everything derived from it lives in `AppSettings+OutputDirectory.swift`.
+    var customOutputDirBookmark: Data? {
+        didSet { defaults.set(customOutputDirBookmark, forKey: "customOutputDirBookmark") }
+    }
+
+    /// Where output goes when no folder is chosen or the chosen one cannot be
+    /// reached: `~/Downloads/MeetingTranscriber` in production. Injected, like
+    /// `defaults`, so a test can exercise the fallback without resolving to the
+    /// user's real Downloads folder, which is one step from writing into it.
+    let defaultOutputDir: URL
+
+    // MARK: - Diagnostics
+
+    /// Enables verbose diagnostic logging across **all** pipelines: audio
+    /// capture (process/device identity, periodic RMS), transcription
+    /// (segment counts, input RMS, sample-rate validation), VAD (segment
+    /// boundaries, round-trip checks), diarization, speaker matching
+    /// (top-2 candidates + margins), and protocol generation. Off by
+    /// default. Logs go to `com.meetingtranscriber` and
+    /// `com.meetingtranscriber.audiotap`. Use the "Export Diagnostics"
+    /// button in Settings → Advanced to attach a log to a bug report.
+    var verboseDiagnostics: Bool {
+        didSet { defaults.set(verboseDiagnostics, forKey: "verboseDiagnostics") }
+    }
+
+    #if !APPSTORE && !PIP_EDITION
+        var debugRPCEnabled: Bool {
+            didSet { defaults.set(debugRPCEnabled, forKey: "debugRPCEnabled") }
+        }
+    #endif
+
+    // MARK: - Updates
+
+    var checkForUpdates: Bool {
+        didSet { defaults.set(checkForUpdates, forKey: "checkForUpdates") }
+    }
+
+    var includePreReleases: Bool {
+        didSet { defaults.set(includePreReleases, forKey: "includePreReleases") }
+    }
+
+    // MARK: - Init
+
+    // swiftlint:disable:next function_body_length
+    init(
+        defaults: UserDefaults = .standard,
+        apiKeyAccount: String = "openAIAPIKey",
+        claudeAPIKeyAccount: String = "claudeAPIKey",
+        defaultOutputDir: URL = AppPaths.downloadsProtocolsDir,
+    ) {
+        self.defaults = defaults
+        self.apiKeyAccount = apiKeyAccount
+        self.claudeAPIKeyAccount = claudeAPIKeyAccount
+        self.defaultOutputDir = defaultOutputDir
+
+        watchTeams = defaults.object(forKey: "watchTeams") as? Bool ?? true
+        watchZoom = defaults.object(forKey: "watchZoom") as? Bool ?? true
+        watchWebex = defaults.object(forKey: "watchWebex") as? Bool ?? true
+        watchBrowserMeetings = defaults.object(forKey: "watchBrowserMeetings") as? Bool ?? false
+        consentDeniedApps = defaults.stringArray(forKey: "consentDeniedApps") ?? []
+        watchWeChat = defaults.object(forKey: "watchWeChat") as? Bool ?? false
+        watchTencentMeeting = defaults.object(forKey: "watchTencentMeeting") as? Bool ?? false
+        watchFaceTime = defaults.object(forKey: "watchFaceTime") as? Bool ?? false
+        watchWhatsApp = defaults.object(forKey: "watchWhatsApp") as? Bool ?? false
+        watchCustomApps = defaults.stringArray(forKey: "watchCustomApps") ?? []
+        autoWatch = defaults.object(forKey: "autoWatch") as? Bool ?? false
+
+        pollInterval = defaults.object(forKey: "pollInterval") as? Double ?? 3.0
+        endGrace = defaults.object(forKey: "endGrace") as? Double ?? 15.0
+        noMic = defaults.object(forKey: "noMic") as? Bool ?? false
+        recordOnly = defaults.object(forKey: "recordOnly") as? Bool ?? false
+        micDeviceUID = defaults.object(forKey: "micDeviceUID") as? String ?? ""
+        micName = defaults.object(forKey: "micName") as? String ?? "Me"
+        perChannelIndicatorEnabled = defaults.object(forKey: "perChannelIndicatorEnabled") as? Bool ?? true
+        silentTrackWatchdogEnabled = defaults.object(forKey: "silentTrackWatchdogEnabled") as? Bool ?? false
+        liveTranscriptionEnabled = defaults.object(forKey: "liveTranscriptionEnabled") as? Bool ?? false
+        liveCaptionsOverlayEnabled = defaults.object(forKey: "liveCaptionsOverlayEnabled") as? Bool ?? true
+        liveCaptionsSize = defaults.string(forKey: "liveCaptionsSize")
+            .flatMap(LiveCaptionsSize.init(rawValue:)) ?? .medium
+        asymmetricSilenceWarningSeconds = max(30, min(300, defaults.object(forKey: "asymmetricSilenceWarningSeconds") as? Double ?? 90))
+
+        transcriptionEngine = (defaults.string(forKey: "transcriptionEngine")
+            .flatMap(TranscriptionEngineSetting.init(rawValue:))) ?? .whisperKit
+        whisperKitModel = defaults.object(forKey: "whisperKitModel") as? String
+            ?? "openai_whisper-large-v3-v20240930_turbo"
+        whisperLanguage = defaults.object(forKey: "whisperLanguage") as? String ?? "de"
+        parakeetLanguage = defaults.object(forKey: "parakeetLanguage") as? String ?? ""
+        customVocabularyPath = defaults.string(forKey: "customVocabularyPath") ?? ""
+        customVocabularyBookmark = defaults.data(forKey: "customVocabularyBookmark")
+        whisperKitVocabularyPromptEnabled = defaults.object(forKey: "whisperKitVocabularyPromptEnabled") as? Bool ?? false
+        let savedTerminologyRules = defaults.string(forKey: "terminologyRulesText") ?? ""
+        terminologyRulesText = savedTerminologyRules
+        terminologyRulesValidation = TerminologyNormalizer(rulesText: savedTerminologyRules).diagnostics
+        customVocabularyValidation = .notConfigured
+        diarize = defaults.object(forKey: "diarize") as? Bool ?? true
+        vadEnabled = defaults.object(forKey: "vadEnabled") as? Bool ?? false
+        vadThreshold = defaults.object(forKey: "vadThreshold") as? Float ?? 0.5
+        echoCancellationEnabled = defaults.object(forKey: "echoCancellationEnabled") as? Bool ?? false
+        echoDedupEnabled = defaults.object(forKey: "echoDedupEnabled") as? Bool ?? false
+        diarizerMode = (defaults.string(forKey: "diarizerMode")
+            .flatMap(DiarizerMode.init(rawValue:))) ?? .offline
+        numSpeakers = defaults.object(forKey: "numSpeakers") as? Int ?? 0
+
+        let t = Self.loadDiarizerTuning(from: defaults)
+        (clusterThreshold, warmStartFa, warmStartFb, minSegmentDurationSeconds, excludeOverlap) =
+            (t.clusterThreshold, t.warmStartFa, t.warmStartFb, t.minSegmentDuration, t.excludeOverlap)
+
+        #if !PIP_EDITION
+            let storedProvider = defaults.string(forKey: "protocolProvider")
+                .flatMap(ProtocolProvider.init(rawValue:))
+        #endif
+        #if PIP_EDITION
+            protocolProvider = .none
+        #elseif APPSTORE
+            protocolProvider = storedProvider ?? .openAICompatible
+        #else
+            protocolProvider = storedProvider ?? .claudeCLI
+            claudeBin = defaults.object(forKey: "claudeBin") as? String ?? "claude"
+        #endif
+        protocolLanguage = defaults.string(forKey: "protocolLanguage") ?? "German"
+        includeFullTranscriptInProtocol = defaults.object(forKey: "includeFullTranscriptInProtocol") as? Bool ?? true
+        saveRawTranscriptSeparately = defaults.object(forKey: "saveRawTranscriptSeparately") as? Bool ?? true
+
+        openAIEndpoint = defaults.object(forKey: "openAIEndpoint") as? String
+            ?? Self.defaultOpenAIEndpoint
+        openAIModel = defaults.object(forKey: "openAIModel") as? String ?? "llama3.1"
+        customOutputDirBookmark = defaults.data(forKey: "customOutputDirBookmark")
+
+        // Migrate legacy "audioDebugLogging" key (renamed to "verboseDiagnostics" 2026-05-04).
+        // New key wins if both are set; legacy value seeds the new key on first launch.
+        if let new = defaults.object(forKey: "verboseDiagnostics") as? Bool {
+            verboseDiagnostics = new
+        } else if let legacy = defaults.object(forKey: "audioDebugLogging") as? Bool {
+            verboseDiagnostics = legacy
+            defaults.set(legacy, forKey: "verboseDiagnostics")
+        } else {
+            verboseDiagnostics = false
+        }
+        // Drop legacy key once the new key is populated, so a future second
+        // migration pass can't resurrect a stale value.
+        if defaults.object(forKey: "audioDebugLogging") != nil,
+           defaults.object(forKey: "verboseDiagnostics") != nil {
+            defaults.removeObject(forKey: "audioDebugLogging")
+        }
+        #if !APPSTORE && !PIP_EDITION
+            debugRPCEnabled = defaults.object(forKey: "debugRPCEnabled") as? Bool ?? false
+        #endif
+        checkForUpdates = defaults.object(forKey: "checkForUpdates") as? Bool ?? true
+        includePreReleases = defaults.object(forKey: "includePreReleases") as? Bool ?? false
+        #if PIP_EDITION
+            // Product policy overrides persisted values on every construction.
+            // Transport/automation code is excluded separately, not just hidden.
+            autoWatch = false
+            watchTeams = false
+            watchZoom = false
+            watchWebex = false
+            watchBrowserMeetings = false
+            watchWeChat = false
+            watchTencentMeeting = false
+            watchFaceTime = false
+            watchWhatsApp = false
+            watchCustomApps = []
+            checkForUpdates = false
+            liveTranscriptionEnabled = false
+            if defaults.object(forKey: "diarize") == nil { diarize = false }
+            saveRawTranscriptSeparately = true
+            if defaults.object(forKey: "whisperKitModel") == nil {
+                whisperKitModel = "openai_whisper-tiny.en"
+            }
+            if defaults.object(forKey: "whisperLanguage") == nil { whisperLanguage = "en" }
+            if defaults.object(forKey: "protocolLanguage") == nil { protocolLanguage = "English" }
+        #endif
+        refreshCustomVocabularyValidation()
+    }
+
+    /// Bag of values used during init to read all 5 tuning knobs in one go.
+    /// Keeps the init body under the lint length budget without duplicating
+    /// the lookup pattern five times.
+    private struct LoadedDiarizerTuning {
+        let clusterThreshold: Double
+        let warmStartFa: Double
+        let warmStartFb: Double
+        let minSegmentDuration: Double
+        let excludeOverlap: Bool
+    }
+
+    private static func loadDiarizerTuning(from defaults: UserDefaults) -> LoadedDiarizerTuning {
+        LoadedDiarizerTuning(
+            clusterThreshold: defaults.object(forKey: "diarizerClusterThreshold") as? Double
+                ?? DiarizerTuningDefaults.clusterThreshold,
+            warmStartFa: defaults.object(forKey: "diarizerWarmStartFa") as? Double
+                ?? DiarizerTuningDefaults.warmStartFa,
+            warmStartFb: defaults.object(forKey: "diarizerWarmStartFb") as? Double
+                ?? DiarizerTuningDefaults.warmStartFb,
+            minSegmentDuration: defaults.object(forKey: "diarizerMinSegmentDuration") as? Double
+                ?? DiarizerTuningDefaults.minSegmentDurationSeconds,
+            excludeOverlap: defaults.object(forKey: "diarizerExcludeOverlap") as? Bool
+                ?? DiarizerTuningDefaults.excludeOverlap,
+        )
+    }
+}

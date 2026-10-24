@@ -1,0 +1,217 @@
+@testable import AudioTapLib
+import XCTest
+
+final class SampleRateQueryTests: XCTestCase {
+    // MARK: - validateSampleRate
+
+    func testValidRatePassesThrough() {
+        let result = SampleRateQuery.validateSampleRate(
+            queriedRate: 48000,
+            requestedRate: 48000,
+        )
+        XCTAssertEqual(result, 48000)
+    }
+
+    func testValidRateDiffersFromRequested() {
+        let result = SampleRateQuery.validateSampleRate(
+            queriedRate: 44100,
+            requestedRate: 48000,
+        )
+        XCTAssertEqual(result, 44100)
+    }
+
+    func testZeroRateFallsBackToRequested() {
+        let result = SampleRateQuery.validateSampleRate(
+            queriedRate: 0,
+            requestedRate: 48000,
+        )
+        XCTAssertEqual(result, 48000)
+    }
+
+    func testNegativeRateFallsBackToRequested() {
+        let result = SampleRateQuery.validateSampleRate(
+            queriedRate: -1,
+            requestedRate: 48000,
+        )
+        XCTAssertEqual(result, 48000)
+    }
+
+    func testCommonUSBRatesAccepted() {
+        for rate in [8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000] {
+            let result = SampleRateQuery.validateSampleRate(
+                queriedRate: rate,
+                requestedRate: 48000,
+            )
+            // Whether a plausible rate was "accepted" or "fell back" is no
+            // longer observable, and for the 48000 row it never mattered: both
+            // answers are 48000. That indistinguishability is why the reporting
+            // was dropped rather than kept for its own sake.
+            XCTAssertEqual(result, rate, "Rate \(rate) should be accepted")
+        }
+    }
+
+    func testUnreasonablyHighRateFallsBack() {
+        let result = SampleRateQuery.validateSampleRate(
+            queriedRate: 1_000_000,
+            requestedRate: 48000,
+        )
+        XCTAssertEqual(result, 48000)
+    }
+
+    // MARK: - crossValidateRate
+
+    func testCrossValidationMatchingRates() {
+        let result = SampleRateQuery.crossValidateRate(
+            nominalRate: 48000,
+            streamRate: 48000,
+        )
+        XCTAssertEqual(result, .consistent(rate: 48000))
+    }
+
+    func testCrossValidationMismatch() {
+        let result = SampleRateQuery.crossValidateRate(
+            nominalRate: 48000,
+            streamRate: 44100,
+        )
+        XCTAssertEqual(result, .mismatch(nominal: 48000, stream: 44100))
+    }
+
+    func testCrossValidationOnlyNominal() {
+        let result = SampleRateQuery.crossValidateRate(
+            nominalRate: 48000,
+            streamRate: 0,
+        )
+        XCTAssertEqual(result, .onlyNominal(rate: 48000))
+    }
+
+    func testCrossValidationOnlyStream() {
+        let result = SampleRateQuery.crossValidateRate(
+            nominalRate: 0,
+            streamRate: 44100,
+        )
+        XCTAssertEqual(result, .onlyStream(rate: 44100))
+    }
+
+    func testCrossValidationBothZero() {
+        let result = SampleRateQuery.crossValidateRate(
+            nominalRate: 0,
+            streamRate: 0,
+        )
+        XCTAssertEqual(result, .neitherAvailable)
+    }
+
+    // MARK: - snapToStandardRate
+
+    func testSnapExact48000() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(48000), 48000)
+    }
+
+    func testSnapExact44100() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(44100), 44100)
+    }
+
+    func testSnapNear48000() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(47950), 48000)
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(48050), 48000)
+    }
+
+    func testSnapNear44100() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(44000), 44100)
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(44200), 44100)
+    }
+
+    func testSnapNear24000() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(23900), 24000)
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(24100), 24000)
+    }
+
+    func testSnapNear16000() {
+        XCTAssertEqual(SampleRateQuery.snapToStandardRate(15900), 16000)
+    }
+
+    // MARK: - inferRateFromDuration
+
+    func testInferRate48kStereo60s() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 23_040_000, bytesPerSample: 4, channels: 2, durationSeconds: 60.0,
+        )
+        XCTAssertEqual(result, 48000)
+    }
+
+    func testInferRate44100Stereo60s() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 21_168_000, bytesPerSample: 4, channels: 2, durationSeconds: 60.0,
+        )
+        XCTAssertEqual(result, 44100)
+    }
+
+    func testInferRate24kMono30s() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 30 * 24000 * 1 * 4, bytesPerSample: 4, channels: 1, durationSeconds: 30.0,
+        )
+        XCTAssertEqual(result, 24000)
+    }
+
+    func testInferRateZeroBytesReturnsNil() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 0, bytesPerSample: 4, channels: 2, durationSeconds: 60.0,
+        )
+        XCTAssertNil(result)
+    }
+
+    func testInferRateTooShortReturnsNil() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 48000 * 4, bytesPerSample: 4, channels: 1, durationSeconds: 0.5,
+        )
+        XCTAssertNil(result)
+    }
+
+    func testInferRateImplausibleHighReturnsNil() {
+        let result = SampleRateQuery.inferRateFromDuration(
+            rawBytes: 500_000 * 4 * 2 * 60, bytesPerSample: 4, channels: 2, durationSeconds: 60.0,
+        )
+        XCTAssertNil(result)
+    }
+
+    // MARK: - confirmedRateChange (issue #673)
+
+    /// The published rate is only replaced when the measurement is both
+    /// materially different and lands on a standard rate. Everything else is
+    /// jitter, drift, or a window that straddles the change.
+
+    func testAMeasurementMatchingThePublishedRateIsNotAChange() {
+        XCTAssertNil(SampleRateQuery.confirmedRateChange(measured: 48000.2, current: 48000))
+        XCTAssertNil(SampleRateQuery.confirmedRateChange(measured: 47999.0, current: 48000))
+        XCTAssertNil(
+            SampleRateQuery.confirmedRateChange(measured: 47800.0, current: 48000),
+            "0.4 % is inside tolerance: truncating this to 47800 would churn the converter",
+        )
+    }
+
+    func testAHalvedOrDoubledRateIsAChange() {
+        XCTAssertEqual(SampleRateQuery.confirmedRateChange(measured: 24000.6, current: 48000), 24000)
+        XCTAssertEqual(SampleRateQuery.confirmedRateChange(measured: 47997.0, current: 24000), 48000)
+        XCTAssertEqual(SampleRateQuery.confirmedRateChange(measured: 16000.0, current: 48000), 16000)
+    }
+
+    func testAMeasurementBetweenStandardRatesIsRejected() {
+        XCTAssertNil(
+            SampleRateQuery.confirmedRateChange(measured: 36000.0, current: 48000),
+            "a transitional window snaps to 32000 but is 12 % away from it",
+        )
+        XCTAssertNil(
+            SampleRateQuery.confirmedRateChange(measured: 50000.0, current: 48000),
+            "a non-standard device rate is not adopted today and must not start being",
+        )
+    }
+
+    func testAnUnknownPublishedRateAcceptsAnyStandardMeasurement() {
+        XCTAssertEqual(SampleRateQuery.confirmedRateChange(measured: 48000.0, current: 0), 48000)
+    }
+
+    func testImplausibleMeasurementsAreRejected() {
+        XCTAssertNil(SampleRateQuery.confirmedRateChange(measured: 0, current: 48000))
+        XCTAssertNil(SampleRateQuery.confirmedRateChange(measured: -48000, current: 48000))
+        XCTAssertNil(SampleRateQuery.confirmedRateChange(measured: 500_000, current: 48000))
+    }
+}

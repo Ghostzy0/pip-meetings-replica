@@ -1,0 +1,149 @@
+import SwiftUI
+import UserNotifications
+
+struct SettingsView: View {
+    @Bindable var settings: AppSettings
+    var whisperKitEngine: WhisperKitEngine
+    var parakeetEngine: ParakeetEngine
+    var updateChecker: UpdateChecker?
+
+    /// Notification visibility from `PermissionsController`, forwarded to the
+    /// General tab so it can warn when browser-meeting consent cannot reach the
+    /// user. Nil until the first permission check completes.
+    var notificationVisibility: NotificationVisibility?
+    /// Required: the same actor instance the pipeline writes to, so the Stats
+    /// tab and the pipeline don't race two writers on `recognition_log.jsonl`.
+    var recognitionStatsLog: RecognitionStatsLog
+    /// Same actor instance the pipeline writes to, so the Processing Stats tab
+    /// and the pipeline don't race two writers on `stage_timing.jsonl`.
+    var stageTimingLog: StageTimingLog
+    /// Factory for the voice-enrollment diarizer. nil → enroll button hidden.
+    var enrollmentDiarizerFactory: (() -> any DiarizationProvider)?
+    /// True when a meeting is currently waiting on a naming dialog. We gate
+    /// the enroll button to avoid two `SpeakerNamingView` instances.
+    var namingDialogActive: Bool = false
+    /// True when the pipeline is processing a job — soft hint only.
+    var pipelineBusy: Bool = false
+    var onSpeakerMutate: (() -> Void)?
+
+    @State private var selection: SettingsTab = .general
+
+    var body: some View {
+        splitView
+    }
+
+    private var splitView: some View {
+        NavigationSplitView {
+            List(SettingsTab.allCases, selection: $selection) { tab in
+                Label(tab.label, systemImage: tab.systemImage)
+                    .tag(tab)
+                    .accessibilityIdentifier(A11yID.settingsTab(tab.rawValue))
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+        } detail: {
+            detailView(for: selection)
+        }
+        .navigationTitle("Settings")
+        .frame(
+            minWidth: 760,
+            idealWidth: 860,
+            maxWidth: 1000,
+            minHeight: 520,
+            idealHeight: 640,
+            maxHeight: .infinity,
+        )
+    }
+
+    @ViewBuilder
+    private func detailView(for tab: SettingsTab) -> some View {
+        switch tab {
+        case .general:
+            #if PIP_EDITION
+                PipPrivacySettingsView()
+            #else
+            GeneralSettingsView(
+                settings: settings,
+                notificationVisibility: notificationVisibility,
+            )
+            #endif
+
+        case .audio:
+            AudioSettingsView(settings: settings)
+
+        case .transcription:
+            #if PIP_EDITION
+                PipSpeechSettingsView(settings: settings, whisperKitEngine: whisperKitEngine, parakeetEngine: parakeetEngine)
+            #else
+            TranscriptionSettingsView(
+                settings: settings,
+                whisperKitEngine: whisperKitEngine,
+                parakeetEngine: parakeetEngine,
+            )
+            #endif
+
+        case .speakers:
+            SpeakersSettingsView(
+                settings: settings,
+                recognitionStatsLog: recognitionStatsLog,
+                stageTimingLog: stageTimingLog,
+                enrollmentDiarizerFactory: enrollmentDiarizerFactory,
+                namingDialogActive: namingDialogActive,
+                pipelineBusy: pipelineBusy,
+                onSpeakerMutate: onSpeakerMutate,
+            )
+
+        case .output:
+            #if PIP_EDITION
+                PipOutputSettingsView(settings: settings)
+            #else
+                OutputSettingsView(settings: settings)
+            #endif
+
+        case .advanced:
+            #if PIP_EDITION
+                PipPrivacySettingsView()
+            #else
+                AdvancedSettingsView(settings: settings)
+            #endif
+
+        case .about:
+            #if PIP_EDITION
+                PipAboutView()
+            #else
+                AboutSettingsView(settings: settings, updateChecker: updateChecker)
+            #endif
+        }
+    }
+}
+
+private enum SettingsTab: String, CaseIterable, Identifiable {
+    case general, audio, transcription, speakers, output, advanced, about
+
+    var id: String {
+        rawValue
+    }
+
+    var label: String {
+        switch self {
+        case .general: "General"
+        case .audio: "Audio"
+        case .transcription: "Transcription"
+        case .speakers: "Speakers"
+        case .output: "Output"
+        case .advanced: "Advanced"
+        case .about: "About"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .general: "gear"
+        case .audio: "mic"
+        case .transcription: "waveform"
+        case .speakers: "person.2"
+        case .output: "doc.text"
+        case .advanced: "wrench.and.screwdriver"
+        case .about: "info.circle"
+        }
+    }
+}

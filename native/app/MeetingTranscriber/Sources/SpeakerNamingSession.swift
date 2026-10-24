@@ -1,0 +1,586 @@
+import Foundation
+import os.log
+
+private let logger = Logger(subsystem: AppPaths.logSubsystem, category: "SpeakerNamingSession")
+
+/// Collaborator that `PipelineQueue` calls for whatever it still owns while the
+/// naming session runs. Strictly id-based (never index-based): a job index goes
+/// stale across an `await` when another finished job is evicted by
+/// `completedJobLifetime`, a documented past bug — so the session only ever
+/// addresses a job by its `UUID`. The queue owns the session strongly
+/// (`let naming`); the session holds this delegate weakly at rest (no retain
+/// cycle) but captures it strongly per async flow, so an in-flight naming flow
+/// keeps the queue alive to completion while a flow started against an
+/// already-gone queue no-ops harmlessly. See `SpeakerNamingSession.delegate`.
+@MainActor
+protocol SpeakerNamingSessionDelegate: AnyObject {
+    /// A value copy of the job, or nil if it is no longer tracked.
+    func job(withID id: UUID) -> PipelineJob?
+    func updateJobState(id: UUID, to newState: JobState, error: String?)
+    func addWarning(id: UUID, _ message: String)
+    /// Persist the per-job naming metadata on the (queue-owned) job. `nil`
+    /// for either field means "leave unchanged".
+    /// `wroteSidecarsIn` records a folder as holding this job's sidecars, and
+    /// only a write that succeeded may pass one: the recorded order is what a
+    /// read trusts to find the newest payload.
+    func setNamingMetadata(
+        jobID: UUID, slug: String?, usedDiarizerMode: DiarizerMode?, wroteSidecarsIn: URL?,
+    )
+    /// Apply a speaker DB update AND refresh the queue's cached known-names in
+    /// one step (issue #155): the write+refresh pairing must stay atomic.
+    func updateSpeakerDB(
+        matcher: SpeakerMatcher, mapping: [String: String],
+        embeddings: [String: [Float]], speakingTimes: [String: TimeInterval],
+    )
+    /// Run the LLM protocol generator over a transcript (a queue pipeline stage).
+    func generateProtocol(jobID: UUID, transcript: String, title: String, protocolsDir: URL) async
+    /// Diarize app + mic tracks separately with the shared single-track fallback
+    /// (app-only on mic failure, mic-only on app failure; a queue pipeline stage,
+    /// reused by the late re-run).
+    func runDualTrackDiarization(
+        diarizeProcess: any DiarizationProvider,
+        tracks: (app: URL, mic: URL, micDelay: TimeInterval, viability: DualTrackViability?),
+        speakerCount: Int?, title: String, jobID: UUID,
+    ) async throws -> DiarizationRun
+    /// Render the speaker-labeled transcript from a diarization run + cached
+    /// transcript segments (a queue pipeline stage, reused by the late rewrite).
+    func renderLabeledTranscript(
+        run: DiarizationRun, cachedSegments: [TimestampedSegment],
+        isDualSource: Bool, autoNames: [String: String], note: String?,
+    ) -> String?
+    /// Enter the diarizing stage for a late re-run: `updateJobState(.diarizing)`
+    /// + start the menu's elapsed timer.
+    func namingStageDidStart(jobID: UUID)
+    /// Leave a timed naming stage: stop the elapsed timer.
+    func namingStageDidEnd()
+}
+
+extension SpeakerNamingSessionDelegate {
+    /// Convenience wrapper so call sites that never carry an error message can
+    /// omit the `error:` argument.
+    func updateJobState(id: UUID, to newState: JobState) {
+        updateJobState(id: id, to: newState, error: nil)
+    }
+}
+
+/// Owns the speaker-naming half of the pipeline: the (possibly late) naming
+/// dialog, its persisted sidecars + recognition forensics, and the late
+/// re-diarization / re-apply paths. `PipelineQueue` holds this strongly as
+/// `let naming` and sets `naming.delegate = self` post-init, so SwiftUI
+/// observation follows through the stored property into this nested
+/// `@Observable` (the queue exposes thin forwarders for the direct-dict reads
+/// at `PipelineController` / `AppState+RPC`).
+@MainActor
+@Observable
+final class SpeakerNamingSession {
+    typealias SpeakerNamingData = PipelineQueue.SpeakerNamingData
+    typealias SpeakerNamingResult = PipelineQueue.SpeakerNamingResult
+
+    /// The queue. Weak *at rest* so the queue can own the session strongly with
+    /// no retain cycle; a nil delegate makes the synchronous callbacks no-ops.
+    ///
+    /// Long-running async flows (`reapplySpeakerNames`, `lateDiarization`,
+    /// `generateProtocolForExistingJob`) capture this strongly ONCE at flow
+    /// start and use the local reference throughout. The strong local keeps the
+    /// queue alive for the flow's duration, exactly like the pre-extraction
+    /// `self` capture on the queue's own Tasks did, so an in-flight confirm or
+    /// re-run survives a `PipelineController.rebuild()` queue swap instead of
+    /// dying half-way (transcript rewritten and sidecar deleted, but the
+    /// protocol and `.done` never landing, so the new queue re-processes the
+    /// job from auto-names and drops the user's corrections). The strong local
+    /// also keeps this weak var resolving for any helper that still reads it
+    /// mid-flow. Flows that start with an already-nil delegate no-op harmlessly.
+    weak var delegate: (any SpeakerNamingSessionDelegate)?
+
+    /// Disk persistence for speaker-naming sidecars (keyed by per-job slug).
+    private let namingStore: SpeakerNamingStore
+    let speakerMatcherFactory: () -> SpeakerMatcher
+    let diarizationFactory: (() -> any DiarizationProvider)?
+    /// Optional mode-overriding factory used by `lateDiarization` when the user
+    /// picks a different mode in the re-run UI. `nil` = mode override not
+    /// supported; `lateDiarization` falls back to `diarizationFactory()`.
+    let diarizationFactoryWithMode: ((DiarizerMode) -> any DiarizationProvider)?
+    let protocolGeneratorFactory: (() -> (any ProtocolGenerating)?)?
+    let outputDir: URL?
+    /// nil disables JSONL logging. AppState injects a real instance for
+    /// production; tests leave it nil unless they explicitly assert on the log.
+    let recognitionStatsLog: RecognitionStatsLog?
+
+    /// RAM cache of naming data, rebuilt from disk on `loadSnapshot()` (via
+    /// `restore`). Exposed via a queue forwarder for UI/RPC.
+    var speakerNamingDataByJob: [UUID: SpeakerNamingData] = [:]
+
+    /// Handler for speaker naming. When set, called instead of the default
+    /// continuation-based popup. Used by tests to auto-complete without UI.
+    var speakerNamingHandler: ((SpeakerNamingData) async -> SpeakerNamingResult)?
+
+    /// Per-job snapshot of the auto-name suggestions shown in the dialog, kept
+    /// until the user confirms/skips so `recordRecognition` can write the JSONL
+    /// row. Cleared on completion. Not persisted across launches — if the user
+    /// confirms in a fresh session, the recognition log row will have nil/empty
+    /// `autoName` (acceptable; user data is the real signal).
+    private var stashedSuggestedAtDialog: [UUID: [String: String]] = [:]
+    private var stashedTopCandidates: [UUID: [String: [TopCandidate]]] = [:]
+
+    init(
+        namingStore: SpeakerNamingStore,
+        speakerMatcherFactory: @escaping () -> SpeakerMatcher,
+        diarizationFactory: (() -> any DiarizationProvider)? = nil,
+        diarizationFactoryWithMode: ((DiarizerMode) -> any DiarizationProvider)? = nil,
+        protocolGeneratorFactory: (() -> (any ProtocolGenerating)?)? = nil,
+        outputDir: URL? = nil,
+        recognitionStatsLog: RecognitionStatsLog? = nil,
+    ) {
+        self.namingStore = namingStore
+        self.speakerMatcherFactory = speakerMatcherFactory
+        self.diarizationFactory = diarizationFactory
+        self.diarizationFactoryWithMode = diarizationFactoryWithMode
+        self.protocolGeneratorFactory = protocolGeneratorFactory
+        self.outputDir = outputDir
+        self.recognitionStatsLog = recognitionStatsLog
+    }
+
+    // MARK: - Completion
+
+    /// Called by the UI (or the test handler, via the queue forwarder) when the
+    /// user confirms, skips, or re-runs speaker naming. Always handles "late"
+    /// completion — the pipeline never blocks on naming.
+    /// `source` has no default on purpose: the queue's forwarders default it
+    /// for the UI, but a new path into the session must state where the
+    /// decision came from. An unattributed row would be indistinguishable from
+    /// one written before the field existed, which is exactly the ambiguity
+    /// this field was added to remove.
+    func completeSpeakerNaming(
+        jobID: UUID, result: SpeakerNamingResult, source: RecognitionSource,
+    ) {
+        guard let data = speakerNamingDataByJob[jobID] else { return }
+        let slug = delegate?.job(withID: jobID)?.namingSlug
+
+        switch result {
+        case let .confirmed(userMapping):
+            recordRecognition(
+                jobID: jobID, title: data.meetingTitle,
+                userMapping: userMapping, fallback: data.mapping,
+                source: source,
+            )
+            // Transition out of .speakerNamingPending synchronously so the UI's
+            // close-when-empty check sees the change immediately. This synchronous
+            // pending → generatingProtocol hop is the RPC idempotency contract; a
+            // duplicate confirm is rejected before it can double-record. The
+            // transcript rewrite + protocol generation happen async below.
+            if delegate?.job(withID: jobID)?.state == .speakerNamingPending {
+                delegate?.updateJobState(id: jobID, to: .generatingProtocol)
+            }
+            Task { await reapplySpeakerNames(jobID: jobID, mapping: userMapping) }
+
+        case let .rerun(count):
+            Task { await lateDiarization(jobID: jobID, speakerCount: count) }
+
+        case let .rerunWithMode(mode, count):
+            Task { await lateDiarization(jobID: jobID, speakerCount: count, mode: mode) }
+
+        case .skipped:
+            recordRecognition(
+                jobID: jobID, title: data.meetingTitle,
+                userMapping: nil, fallback: data.mapping,
+                source: source,
+            )
+            acceptAutoNames(jobID: jobID, slug: slug)
+        }
+    }
+
+    /// Re-invoke the injected naming handler after the job reached
+    /// `.speakerNamingPending`. Mirrors the late-rerun re-invocation so the test
+    /// path runs the exact same `completeSpeakerNaming` flow the production UI
+    /// does. Captures `self` strongly for the op duration (bounded); the delegate
+    /// stays weak. No-op when no handler is set (the interactive/production path).
+    func invokeHandler(jobID: UUID, data: SpeakerNamingData) {
+        guard let handler = speakerNamingHandler else { return }
+        Task {
+            let result = await handler(data)
+            // The handler stands in for the dialog, so it reports as the dialog.
+            completeSpeakerNaming(jobID: jobID, result: result, source: .dialog)
+        }
+    }
+
+    /// Skipped or stale-cleanup path: the user accepted (implicitly or by
+    /// timeout) the auto-names. Drops sidecar files synchronously, transitions
+    /// to .done. If a protocol generator is configured AND the transcript file
+    /// exists, fires off protocol generation in the background; the job
+    /// transitions through .generatingProtocol → .done as that completes.
+    private func acceptAutoNames(jobID: UUID, slug: String?) {
+        // Probe the factory's actual output, not just its existence — the
+        // closure is wired even when protocolProvider is `.none`, but returns
+        // nil. Without this, the Task path below fizzles silently
+        // (generateProtocol guards on factory()) and the job sits in
+        // .speakerNamingPending forever.
+        let canGenerateProtocol = (protocolGeneratorFactory?() != nil)
+            && delegate?.job(withID: jobID)?.transcriptPath != nil
+
+        removeNamingData(jobID: jobID, slug: slug)
+
+        // `canGenerateProtocol == true` implies the delegate was alive above
+        // (it resolved the job's transcriptPath); binding it here lets the Task
+        // closure hold the queue strongly from spawn (see `delegate`).
+        if canGenerateProtocol, let delegate {
+            Task { await generateProtocolForExistingJob(jobID: jobID, delegate: delegate) }
+        } else if delegate?.job(withID: jobID)?.state == .speakerNamingPending {
+            delegate?.updateJobState(id: jobID, to: .done)
+        }
+    }
+
+    /// Takes the delegate as a strong parameter (captured by the spawning Task
+    /// in `acceptAutoNames`) so the queue stays alive across the LLM-generation
+    /// await; see `delegate` for the keep-alive rationale.
+    private func generateProtocolForExistingJob(
+        jobID: UUID, delegate: any SpeakerNamingSessionDelegate,
+    ) async {
+        // A job that is gone needs no transition. Anything else must reach a
+        // terminal state on every exit: `acceptAutoNames` has already deleted
+        // the naming sidecars by the time we get here, so bailing out without a
+        // transition would strand the job in `.speakerNamingPending` with
+        // nothing left to name — the naming window would keep reopening on an
+        // empty placeholder, and the next launch would drop the job with no
+        // protocol ever written.
+        guard let job = delegate.job(withID: jobID) else { return }
+        guard let transcriptPath = job.transcriptPath,
+              let transcript = try? String(contentsOf: transcriptPath, encoding: .utf8)
+        else {
+            // Reachable when the transcript was moved or deleted between the
+            // pipeline writing it and the user resolving naming: the caller's
+            // readiness probe only checks that `transcriptPath` is non-nil.
+            delegate.addWarning(id: jobID, "Protocol not generated — transcript file is missing")
+            finishIfUnresolved(jobID: jobID, delegate: delegate)
+            return
+        }
+        await delegate.generateProtocol(
+            jobID: jobID,
+            transcript: transcript,
+            title: job.meetingTitle,
+            // Beside the transcript it is made from, which is the rule the
+            // protocol-only resume uses too.
+            protocolsDir: transcriptPath.deletingLastPathComponent(),
+        )
+        finishIfUnresolved(jobID: jobID, delegate: delegate)
+    }
+
+    /// Move a job to `.done` unless something already advanced it. Accepts
+    /// `.speakerNamingPending` as well as `.generatingProtocol` because the
+    /// generation call can return before its own `.generatingProtocol`
+    /// transition — it guards on the protocol factory, which can go nil between
+    /// the readiness probe and the call. Both shapes leave the job pending, and
+    /// pending with its sidecars deleted is unrecoverable.
+    private func finishIfUnresolved(jobID: UUID, delegate: any SpeakerNamingSessionDelegate) {
+        let state = delegate.job(withID: jobID)?.state
+        if state == .generatingProtocol || state == .speakerNamingPending {
+            delegate.updateJobState(id: jobID, to: .done)
+        }
+    }
+
+    // MARK: - Resolve auto-names + park for the dialog
+
+    /// Match a diarization result against the speaker DB, persist naming data +
+    /// recognition forensics, and return the auto-name mapping to apply to the
+    /// transcript. Parks the job for the (possibly late) naming dialog by
+    /// stashing `SpeakerNamingData`; the dialog is driven later by
+    /// `completeSpeakerNaming`, so this stage never blocks the pipeline. A job
+    /// that opts out via `autoSkipNaming` (headless blocking-transcribe)
+    /// finishes on the auto-names without a dialog.
+    func resolveSpeakerNames(
+        diarization: DiarizationResult,
+        job: (jobID: UUID, title: String, slug: String, participants: [String]),
+        diarizeProcess: any DiarizationProvider,
+        isDualSource: Bool, outputDir: URL,
+    ) -> [String: String] {
+        let (jobID, title, slug, participants) = job
+        // No embeddings → no matching or dialog; keep the diarizer's own names.
+        guard let embeddings = diarization.embeddings else { return diarization.autoNames }
+
+        let matcher = speakerMatcherFactory()
+        let verbose = matcher.matchVerbose(embeddings: embeddings)
+        let matched = verbose.mapValues(\.assignedName)
+        var autoNames = matched
+        let topCandidates = verbose.mapValues(\.topCandidates)
+
+        // Pre-match participants to remaining speakers.
+        if !participants.isEmpty {
+            autoNames = SpeakerMatcher.preMatchParticipants(
+                mapping: autoNames,
+                speakingTimes: diarization.speakingTimes,
+                participants: participants,
+            )
+        }
+
+        let suggestedAtDialog = autoNames
+        let autoMatched = matched.count { $0.key != $0.value }
+        logger.info("[recognition] \(matched.count) speakers, \(autoMatched) auto, \(matched.count - autoMatched) unknown")
+
+        // Use persisted 16kHz path (survives workDir cleanup).
+        let persistedAudioPath = outputDir.appendingPathComponent("recordings")
+            .appendingPathComponent("\(slug)_16k.wav")
+        let namingData = SpeakerNamingData(
+            jobID: jobID,
+            meetingTitle: title,
+            mapping: autoNames,
+            speakingTimes: diarization.speakingTimes,
+            embeddings: embeddings,
+            audioPath: persistedAudioPath,
+            segments: diarization.segments.map { seg in
+                SpeakerNamingData.Segment(start: seg.start, end: seg.end, speaker: seg.speaker)
+            },
+            participants: participants,
+            isDualSource: isDualSource,
+        )
+
+        // Persist naming data and set slug + mode early.
+        let saved = saveNamingData(namingData, slug: slug, in: outputDir)
+        delegate?.setNamingMetadata(
+            jobID: jobID, slug: slug, usedDiarizerMode: diarizeProcess.mode,
+            wroteSidecarsIn: saved ? outputDir : nil,
+        )
+        delegate?.namingStageDidEnd()
+
+        // Stash recognition forensics so the late-confirm path can write the
+        // JSONL row when the user actually confirms (possibly later, via the
+        // re-openable dialog).
+        stashedSuggestedAtDialog[jobID] = suggestedAtDialog
+        stashedTopCandidates[jobID] = topCandidates
+
+        if delegate?.job(withID: jobID)?.autoSkipNaming == true {
+            // Headless blocking-transcribe: accept the auto-assigned names
+            // (exactly like a `.skipped` dialog result) so the job finishes on
+            // its own. Don't stash naming data: there is no interactive client
+            // to resolve it, and parking would wedge the job until the next
+            // launch's 24h stale-cleanup.
+            //
+            // Log it as a resolution like every other path, tagged `.headless`:
+            // the names still land in the transcript, so leaving no row would
+            // hide an auto-accept nobody reviewed.
+            recordRecognition(
+                jobID: jobID, title: title,
+                userMapping: nil, fallback: autoNames,
+                source: .headless,
+            )
+            return autoNames
+        }
+        // Production/interactive: stash the naming data so the queue parks the
+        // job at `.speakerNamingPending` and pops the (re-openable) dialog. The
+        // pipeline continues with the auto-names; the dialog confirms later via
+        // `completeSpeakerNaming` without blocking.
+        speakerNamingDataByJob[jobID] = namingData
+        return autoNames
+    }
+
+    // MARK: - Persistence
+
+    /// Persist naming data, surfacing a per-job warning on failure (the store
+    /// stays I/O-only; the session owns the job-state side effect). A silent
+    /// failure would mean late-confirm won't work after a restart, so make it
+    /// visible: log + warning on the job.
+    ///
+    /// The folder is passed, never implied: the late paths write beside the
+    /// audio the payload describes, while a job running here now writes under
+    /// this session's.
+    ///
+    /// Returns whether the write landed, because only a folder that actually
+    /// received the payload may be recorded on the job. Recording one that did
+    /// not is what made the recorded order unable to answer "which of these
+    /// files is newest".
+    @discardableResult
+    func saveNamingData(_ data: SpeakerNamingData, slug: String, in outputDir: URL) -> Bool {
+        do {
+            try SpeakerNamingStore(outputDir: outputDir).save(data, slug: slug)
+            return true
+        } catch {
+            // Error left redacted: the write target is `<title-slug>_naming.json`,
+            // so a file-write error description would leak the meeting title.
+            logger.error("Failed to save naming data: \(error.localizedDescription)")
+            delegate?.addWarning(id: data.jobID, "Late re-confirm unavailable — naming data could not be persisted")
+            return false
+        }
+    }
+
+    /// Remove all naming-related data for a job: RAM caches, disk JSON, and
+    /// sidecar files. Also clears the recognition-stats stash dicts so they
+    /// don't leak across rerun / stale-cleanup paths.
+    /// `outputDirs` overrides where the sidecars are looked for. Left nil, the
+    /// folders are taken from the job; the session's own store is the fallback
+    /// when that yields nothing, which happens for a job that recorded no
+    /// folder, for a job the delegate no longer tracks, and when the delegate
+    /// is gone.
+    ///
+    /// Following the job rather than the session matters because the two can
+    /// disagree: a job's sidecars sit under the folder that was current when
+    /// they were written, this store writes to the folder that is current now.
+    /// Reaching that state takes a restart, not just a new folder: while a job
+    /// is parked for naming it is not terminal, so it blocks the queue rebuild
+    /// and the session keeps the old folder. Change the folder, quit, and the
+    /// next launch restores that job against the new one.
+    ///
+    /// The cost is not mainly leftover files. For the confirm and auto-accept
+    /// paths the job goes `.done`, and the reaper 60 seconds later removes it
+    /// through `removeJob`, which passes the job's folder: those leaked a
+    /// delay, not the files. `cancelJob` has no reaper and did leak them for
+    /// good, reachable through a late re-diarization, which puts an
+    /// already-named job back into `.diarizing` where Cancel is offered.
+    ///
+    /// The lasting damage is a wrong resume verdict: a `_naming.json` left in
+    /// the old folder makes `ProtocolResumePolicy` read the job as still
+    /// needing a full run, so after a quit mid-protocol the job starts over
+    /// and parks in the dialog again. The confirmed transcript file is not
+    /// deleted, it is stranded under the old folder while the job points at a
+    /// fresh one, and the confirmed names are already in the speaker
+    /// database, so the returning dialog comes pre-filled. What is lost is the
+    /// run, not the file.
+    ///
+    /// In the sandboxed build the old folder carries no security scope, so the
+    /// deletion there fails and is logged once per sidecar; that is no worse
+    /// than deleting in a folder that holds nothing, only louder.
+    ///
+    /// The parameter stays for the one caller that cannot use the job: the
+    /// snapshot restore's discard path has already taken the jobs out of the
+    /// list, so the delegate cannot find them.
+    ///
+    /// Several folders, because a job can have written sidecars under more than
+    /// one: the naming data goes down when it is saved and the audio tracks only
+    /// in stage 3, with an output-folder change possible in between. Cleaning up
+    /// only the latest would strand the rest for good, so every recorded folder
+    /// is visited; one that holds nothing costs a no-op.
+    ///
+    /// An empty list and a list left out come to the same thing: the session's
+    /// own store. They can, because that store is always built on the folder
+    /// the queue writes to, so the only way to reach it with an empty list is a
+    /// queue with no output folder, whose store is a no-op anyway.
+    func removeNamingData(jobID: UUID, slug: String?, in outputDirs: [URL] = []) {
+        speakerNamingDataByJob.removeValue(forKey: jobID)
+        stashedSuggestedAtDialog.removeValue(forKey: jobID)
+        stashedTopCandidates.removeValue(forKey: jobID)
+        let resolved = outputDirs.isEmpty
+            ? (delegate?.job(withID: jobID)?.sidecarOutputDirs ?? [])
+            : outputDirs
+        for store in stores(in: resolved) {
+            store.deleteNamingJSON(slug: slug)
+            store.cleanupSidecarFiles(slug: slug)
+        }
+    }
+
+    /// Removes only the transcript-bearing segment sidecar. The queue uses this
+    /// when the user opts out of permanent raw transcript output; audio remains
+    /// governed by the normal recording-retention policy.
+    func removeTranscriptSegments(slug: String?) throws {
+        try namingStore.deleteTranscriptSegments(slug: slug)
+    }
+
+    /// Stores for each of `outputDirs`, or this session's own when the list is
+    /// empty.
+    private func stores(in outputDirs: [URL]) -> [SpeakerNamingStore] {
+        outputDirs.isEmpty ? [namingStore] : outputDirs.map { SpeakerNamingStore(outputDir: $0) }
+    }
+
+    /// The folder a job's sidecars are in: the newest folder the job recorded,
+    /// else this session's own.
+    ///
+    /// The newest folder the job recorded that holds any of `suffixes`, or nil
+    /// when none does.
+    ///
+    /// Probed rather than assumed, because a recorded folder is not proof that
+    /// the file is there: the newest can be one the user has since removed, and
+    /// stage 3 persists the mix, the two tracks and the segments as four
+    /// independent best-effort moves, so one folder can hold some of them and
+    /// another the rest.
+    ///
+    /// Each caller asks for what it reads, for the same reason. Nil rather than
+    /// a folder known to lack the file, so the caller reports "not found"
+    /// instead of failing later against a path it was handed.
+    func sidecarDir(of job: PipelineJob, slug: String, holdingAnyOf suffixes: [String]) -> URL? {
+        let root = job.sidecarDirs(orCurrent: outputDir).reversed().first { folder in
+            let store = SpeakerNamingStore(outputDir: folder)
+            return suffixes.contains { store.hasSidecar(slug: slug, suffix: $0) }
+        }
+        return root.map { $0.appendingPathComponent("recordings") }
+    }
+
+    /// The `recordings` folder of the newest root the job recorded, for a caller
+    /// that must carry on when the file it wants is in none of them.
+    func recordingsDir(of job: PipelineJob) -> URL? {
+        job.sidecarDirs(orCurrent: outputDir).last?.appendingPathComponent("recordings")
+    }
+
+    /// Rebuild the RAM naming cache for a restored `.speakerNamingPending` job
+    /// from its on-disk sidecar. Returns false when no candidate folder holds
+    /// one (the queue then marks the job `.done`). Called from `loadSnapshot`.
+    ///
+    /// `outputDirs` are the folders to try, empty meaning this session's own
+    /// store. The freshest readable payload that names this job wins; which
+    /// folders are offered is `sidecarDirsNewestFirst`'s decision, and ties fall
+    /// back to that order.
+    func restore(jobID: UUID, slug: String, in outputDirs: [URL] = []) -> Bool {
+        // In the order given, which is newest recorded first, and that order is
+        // now truthful: a folder is recorded only by a write that landed there.
+        // Taking the file's modification time instead was tried and dropped — a
+        // backup restore or a sync client can restamp an older copy, and a
+        // backward clock correction between two real writes inverts it.
+        //
+        // Only payloads that name this job. The slug carries the title, the
+        // start minute and eight hex digits of the id, so two jobs can agree on
+        // it, and a file left by another job would otherwise be restored here.
+        for store in stores(in: outputDirs) {
+            guard let data = store.load(slug: slug), data.jobID == jobID else { continue }
+            speakerNamingDataByJob[jobID] = data
+            return true
+        }
+        return false
+    }
+
+    /// Auto-resolve pending naming items older than maxAge. Generates the
+    /// protocol with auto-names, transitions them to .done, deletes sidecars.
+    /// `pendingJobs` is the queue's already-filtered `.speakerNamingPending` list.
+    func cleanupStalePending(pendingJobs: [PipelineJob], maxAge: TimeInterval = 86400) {
+        let now = Date()
+        for job in pendingJobs where now.timeIntervalSince(job.namingDeadlineStart) > maxAge {
+            logger.info("Auto-resolving stale pending naming for \(job.meetingTitle, privacy: .private)")
+            // Log it like any other resolution. This used to accept the
+            // auto-names with no row at all, which made a job that nobody ever
+            // decided indistinguishable from one that was never diarized.
+            if let data = speakerNamingDataByJob[job.id] {
+                recordRecognition(
+                    jobID: job.id, title: data.meetingTitle,
+                    userMapping: nil, fallback: data.mapping,
+                    source: .stale,
+                )
+            }
+            acceptAutoNames(jobID: job.id, slug: job.namingSlug)
+        }
+    }
+
+    // MARK: - Recognition forensics
+
+    /// Pull stashed forensics for a job and write the recognition-stats row.
+    /// Falls back to the original SpeakerNamingData mapping when the stash is
+    /// missing (e.g. the user confirmed in a fresh app session). Logs outcome
+    /// counts immediately; the JSONL append runs in a detached Task.
+    private func recordRecognition(
+        jobID: UUID, title: String,
+        // swiftlint:disable:next discouraged_optional_collection
+        userMapping: [String: String]?, fallback: [String: String],
+        source: RecognitionSource,
+    ) {
+        let events = RecognitionStats.buildEvents(
+            suggested: stashedSuggestedAtDialog[jobID] ?? fallback,
+            userMapping: userMapping,
+            topCandidates: stashedTopCandidates[jobID] ?? [:],
+            jobID: jobID, meetingTitle: title, source: source,
+        )
+        var counts: [RecognitionAction: Int] = [:]
+        for e in events {
+            counts[e.action, default: 0] += 1
+        }
+        let parts = RecognitionAction.allCases
+            .map { "\($0.rawValue)=\(counts[$0] ?? 0)" }
+            .joined(separator: " ")
+        logger.info("[recognition] outcome \(parts, privacy: .public)")
+        if let recognitionStatsLog {
+            Task { await recognitionStatsLog.append(events) }
+        }
+    }
+}

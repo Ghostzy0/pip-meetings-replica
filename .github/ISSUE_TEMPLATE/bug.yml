@@ -1,0 +1,18 @@
+name: Reproducible bug
+description: Report a failure with synthetic audio or meeting data.
+body:
+  - type: markdown
+    attributes:
+      value: 'Never upload private audio, transcripts, account data or recordings of other people.'
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps, expected result and actual result
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Edition/version, macOS version and architecture
+    validations:
+      required: true

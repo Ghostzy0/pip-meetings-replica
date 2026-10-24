@@ -1,0 +1,263 @@
+import AVFoundation
+import CoreAudio
+import Foundation
+
+/// Target sample rate for speech recognition (WhisperKit).
+/// Must match `AudioConstants.targetSampleRate` in the app target.
+public let speechSampleRate: Double = 16000
+
+/// Cached mach timebase info (constant per boot session).
+private let machTimebaseInfo: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+/// Convert mach_absolute_time() ticks to seconds.
+func machTicksToSeconds(_ ticks: UInt64) -> Double {
+    let nanos = Double(ticks) * Double(machTimebaseInfo.numer) / Double(machTimebaseInfo.denom)
+    return nanos / 1_000_000_000.0
+}
+
+/// Convert seconds to mach_absolute_time() ticks (inverse of machTicksToSeconds).
+func secondsToMachTicks(_ seconds: Double) -> UInt64 {
+    let nanos = seconds * 1_000_000_000
+    return UInt64(nanos * Double(machTimebaseInfo.denom) / Double(machTimebaseInfo.numer))
+}
+
+/// Average interleaved multi-channel samples to mono. Passthrough for mono
+/// input; an incomplete trailing frame is dropped. `public` so the app module's
+/// `DualSourceRecorder` can delegate to the same implementation
+/// `StreamingMonoResampler` uses (the app depends on this library, not the
+/// other way round).
+public func downmixToMono(_ samples: [Float], channels: Int) -> [Float] {
+    guard channels >= 2, samples.count >= channels else { return samples }
+    let n = samples.count - (samples.count % channels)
+    var mono = [Float](repeating: 0, count: n / channels)
+    let scale = 1.0 / Float(channels)
+    for i in 0 ..< mono.count {
+        var sum: Float = 0
+        for ch in 0 ..< channels {
+            sum += samples[i * channels + ch]
+        }
+        mono[i] = sum * scale
+    }
+    return mono
+}
+
+/// Output-buffer frame capacity for a sample-rate conversion, with a fixed
+/// headroom margin. `AVAudioConverter` retains a fractional output sample on
+/// each `convert` call; sizing the output buffer to exactly `floor(inputFrames
+/// * ratio)` strands that remainder, and it accumulates into a growing backlog
+/// the converter can never flush — the written track then under-runs wall-clock
+/// and `TimelineAnchor` papers over the deficit by injecting silence mid-speech.
+/// The `headroom` lets the converter emit its retained samples every call so no
+/// backlog builds. Single source of truth for both the mic and app capture
+/// paths. Note `floor(x + headroom) == floor(x) + headroom` for integer
+/// headroom, so this matches a `* ratio + headroom`-then-truncate form exactly.
+func resampleOutputCapacity(
+    inputFrames: AVAudioFrameCount, ratio: Double, headroom: AVAudioFrameCount = 16,
+) -> AVAudioFrameCount {
+    AVAudioFrameCount(Double(inputFrames) * ratio) + headroom
+}
+
+/// Write all bytes to a file descriptor using POSIX write() — no Data copy, no Foundation overhead.
+func writeAllToFileHandle(_ fd: Int32, _ ptr: UnsafeRawPointer, count: Int) {
+    var remaining = count
+    var offset = 0
+    while remaining > 0 {
+        let written = write(fd, ptr + offset, remaining)
+        if written < 0 {
+            if errno == EINTR { continue }
+            break
+        }
+        if written == 0 { break }
+        remaining -= written
+        offset += written
+    }
+}
+
+/// Get the UID of the current default output device.
+func getDefaultOutputDeviceUID() -> String? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID,
+    )
+    guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
+
+    var uidAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var uid: Unmanaged<CFString>?
+    var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let uidStatus = AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &uid)
+    guard uidStatus == noErr, let cfUID = uid?.takeRetainedValue() else { return nil }
+    return cfUID as String
+}
+
+/// Read a CFString-valued audio property. Returns nil if the property is unavailable.
+public func readCFStringAudioProperty(
+    _ id: AudioObjectID,
+    _ selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+) -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var s: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &s)
+    guard status == noErr, let cf = s?.takeRetainedValue() else { return nil }
+    return cf as String
+}
+
+/// Bundle ID of a CoreAudio process AudioObject (e.g. "com.microsoft.teams2").
+public func getProcessBundleID(_ processObjectID: AudioObjectID) -> String? {
+    readCFStringAudioProperty(processObjectID, kAudioProcessPropertyBundleID)
+}
+
+/// Human-readable name of the default output device (e.g. "AirPods Pro", "MacBook Pro Speakers").
+public func getDefaultOutputDeviceName() -> String? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID,
+    )
+    guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
+    return readCFStringAudioProperty(deviceID, kAudioObjectPropertyName)
+}
+
+/// Process executable name (e.g. "MSTeams") for a PID. Returns "?" on lookup failure.
+public func getExecutableName(pid: pid_t) -> String {
+    var name = [CChar](repeating: 0, count: 1024)
+    let result = proc_name(pid, &name, UInt32(name.count))
+    guard result > 0 else { return "?" }
+    return stringFromNullTerminated(name)
+}
+
+/// Decodes a null-terminated `[CChar]` into a Swift `String`. Replaces the
+/// deprecated `String(cString: [CChar])` initializer with the buffer-pointer
+/// variant; the precondition is that `buffer` is non-empty (the only callers
+/// are fixed-size stack buffers populated by a `proc_*` BSD syscall).
+func stringFromNullTerminated(_ buffer: [CChar]) -> String {
+    buffer.withUnsafeBufferPointer { buf in
+        // swiftlint:disable:next force_unwrapping
+        String(cString: buf.baseAddress!)
+    }
+}
+
+/// Resolve the AudioObjectID of the system default input or output device,
+/// keeping "the system could not answer" apart from "there is no default".
+///
+/// The distinction only matters to the diagnostics (`AggregateRunProbe`), which
+/// has to render the two differently or a reader draws the first conclusion
+/// from the second. Everything else wants one optional and gets it below.
+func defaultDeviceReading(
+    selector: AudioObjectPropertySelector,
+) -> ProcessOutputState.Reading<AudioObjectID> {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var deviceID = AudioObjectID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID,
+    )
+    guard status == noErr else { return .failed(status) }
+    return .value(deviceID)
+}
+
+/// The default output device as a reading. Named separately because it is the
+/// one the aggregate binds against, and every caller of it means that one.
+func defaultOutputDeviceReading() -> ProcessOutputState.Reading<AudioObjectID> {
+    defaultDeviceReading(selector: kAudioHardwarePropertyDefaultOutputDevice)
+}
+
+/// Nominal sample rate as a reading, for the same reason as above: a device
+/// reporting 0 and a property that could not be read are different findings.
+func nominalSampleRateReading(deviceID: AudioObjectID) -> ProcessOutputState.Reading<Int> {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var rate: Float64 = 0
+    var size = UInt32(MemoryLayout<Float64>.size)
+    let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &rate)
+    guard status == noErr else { return .failed(status) }
+    return .value(Int(rate))
+}
+
+/// Resolve the AudioObjectID of the system default input or output device.
+/// Folds both "could not ask" and "no default device" into nil, which is what
+/// every caller here wants; `defaultDeviceReading` keeps them apart.
+private func resolveDefaultDevice(selector: AudioObjectPropertySelector) -> AudioObjectID? {
+    guard case let .value(deviceID) = defaultDeviceReading(selector: selector),
+          deviceID != kAudioObjectUnknown else { return nil }
+    return deviceID
+}
+
+/// Transport type of the default output device as a short string
+/// (e.g. "Bluetooth", "USB", "Built-In", "AirPlay", "Aggregate").
+func getDefaultOutputDeviceTransportType() -> String? {
+    guard let deviceID = resolveDefaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice) else {
+        return nil
+    }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyTransportType,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var raw: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &raw) == noErr else { return nil }
+    return transportTypeNames[raw] ?? "Unknown(\(raw))"
+}
+
+private let transportTypeNames: [UInt32: String] = [
+    kAudioDeviceTransportTypeBuiltIn: "Built-In",
+    kAudioDeviceTransportTypeUSB: "USB",
+    kAudioDeviceTransportTypeBluetooth: "Bluetooth",
+    kAudioDeviceTransportTypeBluetoothLE: "Bluetooth-LE",
+    kAudioDeviceTransportTypeHDMI: "HDMI",
+    kAudioDeviceTransportTypeDisplayPort: "DisplayPort",
+    kAudioDeviceTransportTypeAirPlay: "AirPlay",
+    kAudioDeviceTransportTypeAVB: "AVB",
+    kAudioDeviceTransportTypeThunderbolt: "Thunderbolt",
+    kAudioDeviceTransportTypeAggregate: "Aggregate",
+    kAudioDeviceTransportTypeVirtual: "Virtual",
+    kAudioDeviceTransportTypeContinuityCaptureWired: "ContinuityCapture-Wired",
+    kAudioDeviceTransportTypeContinuityCaptureWireless: "ContinuityCapture-Wireless",
+]
+
+func getDefaultOutputDeviceSampleRate() -> Double? {
+    guard let deviceID = resolveDefaultDevice(selector: kAudioHardwarePropertyDefaultOutputDevice) else {
+        return nil
+    }
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain,
+    )
+    var rate: Float64 = 0
+    var size = UInt32(MemoryLayout<Float64>.size)
+    guard AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &rate) == noErr else { return nil }
+    return rate
+}

@@ -1,0 +1,419 @@
+#if !APPSTORE && !PIP_EDITION
+    import AppKit
+    import Foundation
+    import UserNotifications
+
+    extension RPCStateSnapshot.WindowInfo {
+        /// Project an `NSWindow`'s pinning-relevant properties for the RPC
+        /// snapshot. `id` is passed in (the caller already resolved it from the
+        /// window identifier) so this stays a pure value mapping.
+        @MainActor
+        init(window: NSWindow, id: String) {
+            let behavior = window.collectionBehavior
+            self.init(
+                id: id,
+                isVisible: window.isVisible,
+                floating: window.level == .floating,
+                canJoinAllSpaces: behavior.contains(.canJoinAllSpaces),
+                fullScreenAuxiliary: behavior.contains(.fullScreenAuxiliary),
+            )
+        }
+    }
+
+    extension PermissionStatus {
+        /// Stable wire string for the RPC `/state.permissionHealth` snapshot.
+        var rpcValue: String {
+            switch self {
+            case .healthy: "healthy"
+            case .denied: "denied"
+            case .broken: "broken"
+            case .notDetermined: "notDetermined"
+            }
+        }
+    }
+
+    extension PipelineQueue {
+        /// Build the RPC pipeline-queue status from inside `PipelineQueue`, so the
+        /// counter reads are single-hop `self.` accesses. Constructing this
+        /// 4-field struct in `AppState.rpcStateSnapshot` from the two-hop
+        /// `pipeline.queue.…` `@Observable` chain instead blew the type-checker up
+        /// to ~100 ms (cross-type chain access + memberwise init in one body),
+        /// tripping the 300 ms `-warn-long-function-bodies` budget on loaded CI
+        /// runners. Self-access here type-checks in ~2 ms.
+        /// `pendingNamingCount` is passed in (rather than read as
+        /// `pendingSpeakerNamingJobs.count`) so the caller can reuse the count of
+        /// the `pendingNamingJobs` array it already builds — one filter pass, not two.
+        func rpcQueueStatus(pendingNamingCount: Int) -> RPCStateSnapshot.Pipeline {
+            RPCStateSnapshot.Pipeline(
+                isProcessing: isProcessing,
+                activeJobCount: activeJobs.count,
+                waitingJobCount: pendingJobs.count,
+                pendingNamingJobCount: pendingNamingCount,
+            )
+        }
+    }
+
+    extension AppState {
+        /// Build a snapshot of state for the debug RPC. Read-only.
+        func rpcStateSnapshot() -> RPCStateSnapshot {
+            let q = pipeline.queue
+            let stored = SpeakerMatcher().loadDB()
+            let recentNames = SpeakerMatcher.rankByRecency(speakers: stored)
+                .prefix(10).map(\.name)
+            let pendingJobs = q.pendingSpeakerNamingJobs.map { job in
+                let data = q.speakerNamingDataByJob[job.id]
+                return RPCStateSnapshot.PendingNaming(
+                    jobID: job.id.uuidString,
+                    meetingTitle: job.meetingTitle,
+                    speakerCount: data?.mapping.count ?? 0,
+                    namingSlug: job.namingSlug,
+                )
+            }
+            return RPCStateSnapshot(
+                // Built inside PipelineQueue (single-hop) to stay under the
+                // type-check budget — see `rpcQueueStatus`.
+                pipeline: q.rpcQueueStatus(pendingNamingCount: pendingJobs.count),
+                speakerDB: .init(
+                    count: stored.count,
+                    recentNames: recentNames,
+                    knownSpeakerNames: q.knownSpeakerNames,
+                ),
+                pendingNamingJobs: pendingJobs,
+                engines: enginesSnapshot(),
+                lastJob: lastFinishedJobSnapshot(),
+                channelHealth: channelHealthSnapshot(),
+                permissionHealth: permissionHealthSnapshot(),
+                liveCaptions: liveCaptionsSnapshot(),
+                watchState: watching.watchLoop?.state.rawValue,
+                pendingConsentApp: watching.watchLoop?.pendingConsentApp,
+                isManualRecording: watching.isManualRecording,
+                notifications: notificationsSnapshot(),
+                // Built inside AppSettings (single-hop `self.` reads) to stay
+                // under the type-check budget — see `rpcSettingsSnapshot`.
+                settings: settings.rpcSettingsSnapshot(),
+                badge: currentBadge,
+                updateStatus: updateStatusSnapshot(),
+                windows: windowsSnapshot(),
+            )
+        }
+
+        /// Small, stable projection of the watching lifecycle for `/v1/watch`.
+        ///
+        /// Kept separate from `rpcStateSnapshot` on purpose: that snapshot is the
+        /// debug surface and is free to change shape, while this one is polled on
+        /// an interval by third-party controllers and carries a compatibility
+        /// promise. Locals are bound first (rather than reading the two-hop
+        /// `watching.watchLoop.…` `@Observable` chain inline) to keep the
+        /// memberwise init inside the type-check budget — see `rpcQueueStatus`.
+        func watchStatusDTO() -> WatchStatusDTO {
+            let loop = watching.watchLoop
+            let badge = currentBadge.rawValue
+            // nil means the probe has not run, which is not a permission
+            // problem. `BadgeKind.compute` treats it the same way, and the
+            // badge and this field must not disagree.
+            let healthy = permissions.health?.isHealthy != false
+            return WatchStatusDTO(
+                watching: watching.isWatching,
+                state: loop?.state.rawValue,
+                badge: badge,
+                manualRecording: watching.isManualRecording,
+                pendingConsentApp: loop?.pendingConsentApp,
+                permissionsHealthy: healthy,
+            )
+        }
+
+        /// The two `/v1/watch` seams, bundled so `buildDebugRPCServer` stays a
+        /// flat wiring list. Control is `async` because the start awaits the mic
+        /// gate before the loop exists — reporting a snapshot taken before that
+        /// settles would hand a remote key a stale answer to the press it just
+        /// made. Status is this small dedicated projection rather than `/state`,
+        /// which a polling controller must not be pinned to.
+        func watchRPCClosures() -> (
+            status: () -> WatchStatusDTO,
+            control: (WatchAction) async -> WatchControlOutcome,
+        ) {
+            let status: () -> WatchStatusDTO = { [weak self] in
+                self?.watchStatusDTO() ?? .notWatching
+            }
+            let control: (WatchAction) async -> WatchControlOutcome = { [weak self] action in
+                guard let self else { return .failed }
+                return await watching.applyWatchAction(action)
+            }
+            return (status, control)
+        }
+
+        /// Small, stable projection of the microphone-recording lifecycle for
+        /// `/v1/record`, the sibling of `watchStatusDTO()` and kept separate from
+        /// `rpcStateSnapshot` for the same reason.
+        func recordStatusDTO() -> RecordStatusDTO {
+            let loop = watching.watchLoop
+            // Asked through `recordingBlockers`, the same function the gate
+            // inside `WatchLoop` consults, so this cannot come to a different
+            // verdict than the refusal a POST would produce. nil means the probe
+            // has not run, which is not a permission problem — `BadgeKind.compute`
+            // and `WatchStatusDTO.permissionsHealthy` read an unknown result the
+            // same way.
+            let micHealthy = permissions.health?.recordingBlockers(for: .micOnly).isEmpty ?? true
+            return RecordStatusDTO(
+                recording: watching.isRecordingMicrophoneOnly,
+                startPending: watching.isManualStartPending,
+                state: loop?.state.rawValue,
+                badge: currentBadge.rawValue,
+                otherRecordingActive: watching.isRecordingOtherThanMicrophone,
+                noMic: settings.noMic,
+                microphoneHealthy: micHealthy,
+            )
+        }
+
+        /// The two `/v1/record` seams, bundled like `watchRPCClosures` so
+        /// `buildDebugRPCServer` stays a flat wiring list. Control is `async`
+        /// because the start awaits the mic gate, the queue and the loop before
+        /// there is anything true to report.
+        func recordRPCClosures() -> (
+            status: () -> RecordStatusDTO,
+            control: (RecordAction) async -> RecordControlOutcome,
+        ) {
+            let status: () -> RecordStatusDTO = { [weak self] in
+                self?.recordStatusDTO() ?? .notRecording
+            }
+            let control: (RecordAction) async -> RecordControlOutcome = { [weak self] action in
+                guard let self else { return .failed }
+                // Seed the health cache before answering. The status projection
+                // reads that cache while the gate inside the start path falls
+                // back to a *live* probe when it is empty, so on an unprobed
+                // launch `GET` would report a healthy microphone and the `POST`
+                // right after it would refuse with a 412 whose body says nothing
+                // is wrong. One probe closes that, and after it both sides read
+                // the same value.
+                if permissions.health == nil { await permissions.check() }
+                return await watching.applyRecordAction(action)
+            }
+            return (status, control)
+        }
+
+        /// The three per-job speaker-naming seams, bundled for the same reason as
+        /// `watchRPCClosures`: `buildDebugRPCServer` is a flat wiring list, and
+        /// grouping the closures that belong to one route family keeps it one.
+        func namingRPCClosures() -> (
+            status: (UUID) -> NamingStatusDTO?,
+            confirm: (UUID, [String: String]) -> Bool,
+            skip: (UUID) -> Bool,
+        ) {
+            let status: (UUID) -> NamingStatusDTO? = { [weak self] id in
+                self?.pipeline.namingStatus(forID: id)
+            }
+            let confirm: (UUID, [String: String]) -> Bool = { [weak self] id, mapping in
+                self?.pipeline.confirmNaming(jobID: id, mapping: mapping) ?? false
+            }
+            let skip: (UUID) -> Bool = { [weak self] id in
+                self?.pipeline.skipNaming(jobID: id) ?? false
+            }
+            return (status, confirm, skip)
+        }
+
+        /// Project the pinning-relevant properties of each named scene window.
+        /// Only windows carrying a scene identifier (settings, speaker-naming,
+        /// record-app) are included; transient/system windows are skipped.
+        /// Extracted (like the other `*Snapshot` helpers) to keep the
+        /// `rpcStateSnapshot` literal under the type-check budget.
+        private func windowsSnapshot() -> [RPCStateSnapshot.WindowInfo] {
+            // `NSApp` is an implicitly-unwrapped optional that is nil in an
+            // xctest process (no NSApplication is created), so guard it — the
+            // RPC snapshot is built on the main actor from unit tests too.
+            guard let app = NSApp else { return [] }
+            return app.windows.compactMap { window in
+                guard let id = window.identifier?.rawValue else { return nil }
+                return RPCStateSnapshot.WindowInfo(window: window, id: id)
+            }
+        }
+
+        /// Snapshot the update-checker status. Extracted (like the other
+        /// `*Snapshot` helpers) to keep `rpcStateSnapshot`'s literal under the
+        /// type-check budget. Only the release identity + check status — no
+        /// download URLs.
+        private func updateStatusSnapshot() -> RPCStateSnapshot.UpdateStatus {
+            let update = updateChecker.availableUpdate
+            return RPCStateSnapshot.UpdateStatus(
+                available: update != nil,
+                availableVersion: update?.tagName,
+                isPrerelease: update?.prerelease ?? false,
+                isChecking: updateChecker.isChecking,
+                lastError: updateChecker.lastError,
+            )
+        }
+
+        /// Snapshot the recently-posted notifications from the notifier this
+        /// AppState was actually constructed with (the `@main` wiring passes
+        /// `NotificationManager.shared`; other notifiers default to an empty log
+        /// via the protocol extension) and map each entry to the wire shape with
+        /// an ISO-8601 `postedAt`. Extracted (like the other `*Snapshot` helpers)
+        /// to keep `rpcStateSnapshot`'s literal under the type-check budget.
+        private func notificationsSnapshot() -> [RPCStateSnapshot.Notification] {
+            notifier.recentNotifications.map { entry in
+                RPCStateSnapshot.Notification(
+                    title: entry.title,
+                    body: entry.body,
+                    postedAt: Self.isoFormatter.string(from: entry.postedAt),
+                    posted: entry.posted,
+                )
+            }
+        }
+
+        /// Snapshot the live-caption overlay state. `LiveCaptionLine`'s
+        /// `Codable` conformance encodes each entry as
+        /// `{"channel": "mic"|"app", "text": …}` directly — the channel
+        /// enum's raw value IS the wire format, so no mapping needed.
+        private func liveCaptionsSnapshot() -> RPCStateSnapshot.LiveCaptions {
+            RPCStateSnapshot.LiveCaptions(
+                hypothesisMic: liveCaptions.hypothesisMic,
+                hypothesisApp: liveCaptions.hypothesisApp,
+                recentFinals: liveCaptions.recentFinals,
+            )
+        }
+
+        /// Snapshot the channel-health flags. Extracted into a helper (rather
+        /// than inlined in `rpcStateSnapshot`'s already-large literal) because
+        /// reading the three `channelHealth.*` flags through the sub-controller
+        /// inside that expression pushed its type-check over the 300 ms budget.
+        private func channelHealthSnapshot() -> RPCStateSnapshot.ChannelHealth {
+            RPCStateSnapshot.ChannelHealth(
+                micSilent: channelHealth.micSilentActive,
+                appSilent: channelHealth.appSilentActive,
+                recordingSilent: channelHealth.recordingSilentActive,
+                micFault: channelHealth.micFault?.rawValue,
+                appFault: channelHealth.appFault?.rawValue,
+                micLevelDBFS: channelHealth.micLevelDBFS,
+                appLevelDBFS: channelHealth.appLevelDBFS,
+                micSecondsSinceLastBuffer: channelHealth.micAges.secondsSinceLastBuffer,
+                micSecondsSinceLastEnergy: channelHealth.micAges.secondsSinceLastEnergy,
+                appSecondsSinceLastBuffer: channelHealth.appAges.secondsSinceLastBuffer,
+                appSecondsSinceLastEnergy: channelHealth.appAges.secondsSinceLastEnergy,
+            )
+        }
+
+        /// Snapshot the permission health verdict. `nil` before the first async
+        /// check completes → `.unknown`. Extracted (like `channelHealthSnapshot`)
+        /// to keep `rpcStateSnapshot`'s literal under the type-check budget.
+        private func permissionHealthSnapshot() -> RPCStateSnapshot.PermissionHealth {
+            // Per-field fallbacks rather than an early `.unknown` return: the TCC
+            // probe and the notification query complete independently, so one
+            // being unfinished must not blank the other.
+            let health = permissions.health
+            let visibility = permissions.notificationVisibility
+            return RPCStateSnapshot.PermissionHealth(
+                screenRecording: health?.screenRecording.rpcValue ?? "unknown",
+                microphone: health?.microphone.rpcValue ?? "unknown",
+                accessibility: health?.accessibility.rpcValue ?? "unknown",
+                isHealthy: health?.isHealthy ?? false,
+                notifications: visibility?.authorization.rpcValue ?? "unknown",
+                notificationsAlertStyle: visibility?.alertStyle.rpcValue ?? "unknown",
+                notificationsTimeSensitive: visibility?.timeSensitive.rpcValue ?? "unknown",
+                notificationsScheduledDelivery: visibility?.scheduledDelivery.rpcValue ?? "unknown",
+            )
+        }
+
+        /// Most recent `.done`-or-`.error` job from the queue, mapped to the
+        /// snapshot shape. Used by E2E driver scripts to assert on outcome
+        /// after triggering a meeting.
+        private func lastFinishedJobSnapshot() -> RPCStateSnapshot.LastJob? {
+            guard let job = pipeline.queue.jobs.last(where: { job in
+                job.state == .done || job.state == .error
+            }) else {
+                return nil
+            }
+            return RPCStateSnapshot.LastJob(
+                jobID: job.id.uuidString,
+                state: job.state,
+                meetingTitle: job.meetingTitle,
+                appName: job.appName,
+                durationSec: Date().timeIntervalSince(job.enqueuedAt),
+                transcriptPath: job.transcriptPath?.path,
+                protocolPath: job.protocolPath?.path,
+                error: job.error,
+                warnings: job.warnings,
+                participants: job.participants,
+            )
+        }
+
+        /// Read live engine state. Lets `mt-cli state` (and tests) observe
+        /// settings → engine propagation without running a transcription.
+        private func enginesSnapshot() -> RPCStateSnapshot.Engines {
+            RPCStateSnapshot.Engines(
+                active: settings.transcriptionEngine,
+                whisperKit: .init(
+                    modelVariant: engines.whisperKit.modelVariant,
+                    language: engines.whisperKit.language,
+                    modelState: String(describing: engines.whisperKit.modelState).lowercased(),
+                ),
+                parakeet: .init(
+                    customVocabularyPath: engines.parakeetEngine.customVocabularyPath,
+                    modelState: String(describing: engines.parakeetEngine.modelState).lowercased(),
+                ),
+            )
+        }
+
+        /// Closures the RPC server invokes for `/action/{rename,delete,merge}Speaker`.
+        /// Same wiring as `KnownVoicesView.onMutate`: mutate the DB, then refresh
+        /// the cached `knownSpeakerNames` only when the mutation actually changed
+        /// state — `.notFound` paths skip the redundant disk read.
+        ///
+        /// The `speakerMatcherFactory` parameter exists so tests can route
+        /// mutations to a temp-path `SpeakerMatcher` instead of the real
+        /// `~/Library/Application Support/.../speakers.json`. Production uses
+        /// the default and is unaffected.
+        func makeSpeakerDBActions(
+            speakerMatcherFactory: @escaping () -> SpeakerMatcher = { SpeakerMatcher() },
+        ) -> SpeakerDBActions {
+            SpeakerDBActions(
+                rename: { [weak self] from, to in
+                    let result = speakerMatcherFactory().renameSpeaker(from: from, to: to)
+                    let outcome: SpeakerActionOutcome = switch result {
+                    case .renamed: .ok
+                    case .merged: .merged
+                    case .noop: .noop
+                    case .notFound: .notFound
+                    }
+                    if outcome != .notFound { self?.pipeline.queue.refreshKnownSpeakerNames() }
+                    return outcome
+                },
+                delete: { [weak self] name in
+                    let removed = speakerMatcherFactory().deleteSpeaker(name: name)
+                    if removed { self?.pipeline.queue.refreshKnownSpeakerNames() }
+                    return removed ? .ok : .notFound
+                },
+                merge: { [weak self] from, into in
+                    let merged = speakerMatcherFactory().mergeSpeakers(from: from, into: into)
+                    if merged { self?.pipeline.queue.refreshKnownSpeakerNames() }
+                    return merged ? .ok : .notFound
+                },
+                seed: { [weak self] name in
+                    let embedding = (0 ..< Self.seedEmbeddingDimension).map { _ in
+                        Float.random(in: -1 ... 1)
+                    }
+                    speakerMatcherFactory().mutateDB { stored in
+                        stored.append(StoredSpeaker(
+                            name: name,
+                            embeddings: [embedding],
+                            centroid: embedding,
+                            centroidSampleCount: 1,
+                            lastUsed: Date(),
+                            useCount: 1,
+                            // Random vector — must never participate in
+                            // auto-naming a real speaker. Filtered out by
+                            // `SpeakerMatcher.matchVerbose`.
+                            isSynthetic: true,
+                        ))
+                    }
+                    self?.pipeline.queue.refreshKnownSpeakerNames()
+                    return .ok
+                },
+            )
+        }
+
+        /// FluidAudio's diarizer emits 192-dim embeddings; seeded speakers use
+        /// the same shape so they round-trip through `SpeakerMatcher` cleanly.
+        /// Exposed (module-internal) so tests can assert on the shape without
+        /// hardcoding the literal alongside the production source.
+        static let seedEmbeddingDimension = 192
+    }
+#endif

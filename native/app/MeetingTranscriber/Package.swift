@@ -1,0 +1,143 @@
+// swift-tools-version: 6.2
+
+import PackageDescription
+import Foundation
+
+let pipEdition = ProcessInfo.processInfo.environment["PIP_EDITION"] == "1"
+let neutralEdition = ProcessInfo.processInfo.environment["PIP_NEUTRAL"] == "1"
+let enhancedEdition = ProcessInfo.processInfo.environment["MEETINGS_ENHANCEMENTS"] == "1"
+let replicaEdition = ProcessInfo.processInfo.environment["MEETINGS_REPLICA"] == "1"
+precondition(!replicaEdition || (pipEdition && neutralEdition && !enhancedEdition),
+             "MEETINGS_REPLICA is reserved for the neutral core edition")
+let editionSettings: [SwiftSetting] = (pipEdition ? [.define("PIP_EDITION")] : [])
+    + (neutralEdition ? [.define("PIP_NEUTRAL")] : [])
+    + (enhancedEdition ? [.define("MEETINGS_ENHANCEMENTS")] : [])
+    + (replicaEdition ? [.define("MEETINGS_REPLICA")] : [])
+
+let package = Package(
+    name: "MeetingTranscriber",
+    platforms: [.macOS(.v14)],
+    dependencies: [
+        .package(url: "https://github.com/nalexn/ViewInspector", from: "0.10.5"),
+        .package(url: "https://github.com/pointfreeco/swift-snapshot-testing", from: "1.19.1"),
+        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.13.4"),
+        .package(path: "../../tools/audiotap"),
+    ],
+    targets: [
+        // LocalVQE echo-cancellation library (C API over a static xcframework).
+        // SwiftPM downloads the artifact from a pinned release asset and
+        // verifies it against the checksum before linking; no binary lives in
+        // this repository. The artifact is genuinely static — the linked app
+        // gains no new dynamic-library dependencies (otool -L shows system
+        // libraries only).
+        // Hosted on a release of our own vendor repository because upstream
+        // publishes no macOS artifact at all. Checksum-pinned, so a swapped
+        // asset fails the build rather than shipping silently; the exposure
+        // that remains is availability, since the asset disappearing breaks
+        // `swift build` for everyone including CI. Mirror it before relying on
+        // this for a release.
+        //
+        // Its headers sit in `Headers/CLocalVQE/`, not at the root of
+        // `Headers/`, and a rebuild must keep it that way. For a static-library
+        // slice xcodebuild stages every artifact's `Headers/*` into one shared
+        // `include/` directory, so two xcframeworks with a root-level
+        // `module.modulemap` write the same path and the build dies with
+        // "Multiple commands produce". FluidAudio started shipping a binary
+        // target in 0.15.6 and hit exactly that. `swift build` never noticed,
+        // because it passes each artifact's Headers directory as its own `-I`,
+        // which is why this can only fail in Xcode and in the analyze lane.
+        .binaryTarget(
+            name: "CLocalVQE",
+            url: "https://github.com/pasrom/localvqe-xcframework/releases/download/1.0.3/LocalVQE.xcframework.zip",
+            checksum: "15a7503e7d764012ee955ba04cef78a0b24f8d51856fc85b96d9be49d38624ba"
+        ),
+        .executableTarget(
+            name: "MeetingTranscriber",
+            dependencies: [
+                .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "AudioTapLib", package: "audiotap"),
+                "CLocalVQE",
+            ],
+            path: "Sources",
+            // Assets.xcassets is compiled by `actool` in scripts/build_release.sh,
+            // not by SPM. Excluding silences "unhandled file" warnings without
+            // changing the runtime bundle.
+            exclude: ["Info.plist", "Assets.xcassets"],
+            // Treat any new compiler warning as a build failure so deprecations
+            // and concurrency hints are caught at PR time, not on a future
+            // dependency bump. Scoped to our targets only — does not propagate
+            // to WhisperKit/FluidAudio.
+            swiftSettings: editionSettings + [
+                .treatAllWarnings(as: .error),
+                // Surface accidental compile-time blowups. Type-checking a
+                // function body or expression beyond 300 ms is almost always
+                // a sign of pathological generic-overload search or deeply
+                // nested SwiftUI builders. Apple recommends 100 ms; 300 ms
+                // is the historical pre-Swift-6 setting that turned out to
+                // be sustainable once strict-concurrency analysis settled.
+                .unsafeFlags([
+                    "-Xfrontend", "-warn-long-function-bodies=300",
+                    "-Xfrontend", "-warn-long-expression-type-checking=300",
+                ]),
+                .enableUpcomingFeature("ExistentialAny"),
+            ],
+            linkerSettings: [
+                // CLocalVQE is C++ inside and uses Accelerate for its FFT.
+                // A static archive carries no autolink hints, so the consumer
+                // has to name both dependencies explicitly (proven necessary
+                // in the vendoring link spike).
+                .linkedLibrary("c++"),
+                .linkedFramework("Accelerate"),
+            ]
+        ),
+        .testTarget(
+            name: "MeetingTranscriberTests",
+            dependencies: [
+                "MeetingTranscriber",
+                "ViewInspector",
+                .product(name: "SnapshotTesting", package: "swift-snapshot-testing"),
+            ],
+            path: "Tests",
+            // __Snapshots__ is the SnapshotTesting reference-image directory.
+            // Tests load these via filesystem path at runtime, not via the
+            // bundle, so SPM doesn't need to package them as resources.
+            exclude: ["Fixtures", "__Snapshots__"],
+            sources: pipEdition ? [
+                "PipMeetingLibraryTests.swift",
+                "PipEditionPolicyTests.swift",
+                "PipCaptureSessionTests.swift",
+                "PipIndependentRegressionTests.swift",
+                "PipMeetingDraftsTests.swift",
+                "PipLibraryBridgeTests.swift",
+                "PipelineJobTests.swift",
+                "PipelineSnapshotTests.swift",
+                "TranscriptNoteTests.swift",
+                "AudioPersistencePolicyTests.swift",
+                "WavHeaderRepairTests.swift",
+                "RecordingSidecarTests.swift",
+                "DualSourceRecorderCrashRecoveryTests.swift",
+                "XCTestCase+UnfinalizedWav.swift",
+                "LiveCaptureSessionTests.swift",
+                "WhisperKitModelFolderArgumentTests.swift",
+                "TestHelpers.swift",
+                "DefaultsSuite.swift",
+                "MockRecorder.swift",
+                "Quality/GroundTruth.swift",
+                "Quality/QualityResult.swift",
+                "Quality/WERCalculator.swift",
+                "Quality/DERCalculator.swift",
+            ] : nil,
+            swiftSettings: editionSettings + [
+                .treatAllWarnings(as: .error),
+                .unsafeFlags([
+                    "-Xfrontend", "-warn-long-function-bodies=300",
+                    "-Xfrontend", "-warn-long-expression-type-checking=300",
+                ]),
+                .enableUpcomingFeature("ExistentialAny"),
+            ]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
+)

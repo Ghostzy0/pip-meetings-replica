@@ -1,0 +1,234 @@
+{
+  "format": 1,
+  "name": "WhisperKit tiny.en with local tokenizer",
+  "licences": {
+    "argmaxinc/whisperkit-coreml": "MIT",
+    "openai/whisper-tiny.en": "Apache-2.0"
+  },
+  "files": [
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "eaaaa6671a96a359a0bbd5e97885246dcc17f7435b6ffad8d871bb940964500b",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/analytics/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/coremldata.bin",
+      "size": 347,
+      "sha256": "325b182d0a4266730a81795ae6b7a787b5111dd091500fc0c04dedf610015d46",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/metadata.json",
+      "size": 1807,
+      "sha256": "c0468bfcd4c940e479812dc35db6c9bb380c1a9da1786471c0b916e1ee784ff0",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/metadata.json"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/model.mil",
+      "size": 308780,
+      "sha256": "6423991df85b6811ef08a935c86ab4f0cc0a7a072fe24913f3bcfab2c5bebd84",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/model.mil"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/model.mlmodel",
+      "size": 54965,
+      "sha256": "030d64a3ddd296d6f709691a66a870aab7ee9f19e5fe07e8086245fb85302802",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/model.mlmodel"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/weights/weight.bin",
+      "size": 16422784,
+      "sha256": "f3706dac8d9d4bec269d3cee10fa4eda39b4240a46091c8323c1731a8c6d59c2",
+      "local": "openai_whisper-tiny.en/AudioEncoder.mlmodelc/weights/weight.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "160d9737169d22dc01a899e1c6a0a9c44d0637d41f0dedb2a0b7c1422c4035d2",
+      "local": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/analytics/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/coremldata.bin",
+      "size": 328,
+      "sha256": "cb3b3f51b080f58b12a6888a5e8ad57419be9e4c6843b96a7577f171b300e660",
+      "local": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/metadata.json",
+      "size": 1848,
+      "sha256": "d92e196c14b4d03167a8ded97d9f925617ff302942588aa460257eb0c58de35b",
+      "local": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/metadata.json"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/model.mil",
+      "size": 10132,
+      "sha256": "5fe83a96c41965219d39734aa3248bd4956d2427705539fba2d406aa4eeb4862",
+      "local": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/model.mil"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/weights/weight.bin",
+      "size": 354080,
+      "sha256": "801024dbc7a89c677be1f8b285de3409e35f7d1786c9c8d9d0d6842ac57a1c83",
+      "local": "openai_whisper-tiny.en/MelSpectrogram.mlmodelc/weights/weight.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/analytics/coremldata.bin",
+      "size": 243,
+      "sha256": "edb99a30ccee8e157fbec80dc3dce49349ba0982391b327d753e10ccab0a01c3",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/analytics/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/coremldata.bin",
+      "size": 633,
+      "sha256": "65c043a081845d190918b4c7d244f94a55df1a15fae796abedc1f414995542c6",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/coremldata.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/metadata.json",
+      "size": 4754,
+      "sha256": "41dccfd0fe75a8f333abf74a1b0ab5ca007a589e5cb50fa34ec6033936763b58",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/metadata.json"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/model.mil",
+      "size": 135272,
+      "sha256": "0faaeee40f86f6e4bc69b81c7142bc9ca8af7859a597ee0a22eb3df8ad30ab65",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/model.mil"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/model.mlmodel",
+      "size": 108558,
+      "sha256": "5c3e91bc036014426708e2ceb0e35cb1bbbf34e8121d2070d2b174a7957581d0",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/model.mlmodel"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/TextDecoder.mlmodelc/weights/weight.bin",
+      "size": 59215664,
+      "sha256": "763f915f0126093fc2c506572b3ab0fad134c04cfc2221333ccc7d73552c9252",
+      "local": "openai_whisper-tiny.en/TextDecoder.mlmodelc/weights/weight.bin"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/config.json",
+      "size": 1454,
+      "sha256": "4d7b75a6f18d3cd9a4f936cdc16d9e5d855c0acbca21d6a11fbac602a422b6a8",
+      "local": "openai_whisper-tiny.en/config.json"
+    },
+    {
+      "repo": "argmaxinc/whisperkit-coreml",
+      "revision": "0f63a7800b00dd0226abd051b906c246e1907482",
+      "path": "openai_whisper-tiny.en/generation_config.json",
+      "size": 1006,
+      "sha256": "aea4069565b5adaec331005991a1d8613192687aa4cedf2e9dd91b126991df5a",
+      "local": "openai_whisper-tiny.en/generation_config.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "README.md",
+      "size": 14861,
+      "sha256": "13627ce3d7dce389223eab7b6ed06738f0f1c786e5245e650b029e4e314c8ff1",
+      "local": "tokenizer/README.md"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "added_tokens.json",
+      "size": 34604,
+      "sha256": "560be47bea388757f8d4cc185c5d82067426cbb6361e38016dd90ddc01ab203a",
+      "local": "tokenizer/added_tokens.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "config.json",
+      "size": 1937,
+      "sha256": "b5366317df280f79e6cc366f259f379674f81a8721d458acf2e00680ccb10b1d",
+      "local": "tokenizer/config.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "merges.txt",
+      "size": 456318,
+      "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+      "local": "tokenizer/merges.txt"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "normalizer.json",
+      "size": 52666,
+      "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd",
+      "local": "tokenizer/normalizer.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "special_tokens_map.json",
+      "size": 1830,
+      "sha256": "014f8f802366ed818919550be0ad9e35907327cb9e142e8aaa102420f460bda8",
+      "local": "tokenizer/special_tokens_map.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "tokenizer.json",
+      "size": 2405679,
+      "sha256": "5eb60cec1e77aeeb6869a2bb5a8e01a84c3fe5d072d75369343021fe6f5310d0",
+      "local": "tokenizer/tokenizer.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "tokenizer_config.json",
+      "size": 805,
+      "sha256": "14f84bdf4b9ecdbd4738ddc81c17a1baedfc02bb93c6e049c951e15a1b40b70d",
+      "local": "tokenizer/tokenizer_config.json"
+    },
+    {
+      "repo": "openai/whisper-tiny.en",
+      "revision": "87c7102498dcde7456f24cfd30239ca606ed9063",
+      "path": "vocab.json",
+      "size": 798156,
+      "sha256": "3ba3c3109ff33976c4bd966589c11ee14fcaa1f4c9e5e154c2ed7f99d80709e7",
+      "local": "tokenizer/vocab.json"
+    }
+  ]
+}
