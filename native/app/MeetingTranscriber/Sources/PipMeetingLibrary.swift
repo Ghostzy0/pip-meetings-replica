@@ -148,14 +148,30 @@ final class PipMeetingLibrary {
 
     init(root: URL = AppPaths.dataDir.appendingPathComponent("pip-library", isDirectory: true)) throws {
         guard root.isFileURL else { throw PipMeetingLibraryError.unsafePath }
-        if FileManager.default.fileExists(atPath: root.path) {
-            let values = try root.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        let fileManager = FileManager.default
+        let suppliedRoot = root.standardizedFileURL
+        if fileManager.fileExists(atPath: suppliedRoot.path) {
+            let values = try suppliedRoot.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
             guard values.isSymbolicLink != true, values.isDirectory == true else { throw PipMeetingLibraryError.unsafePath }
         }
-        // Normalise directory semantics before creating a missing root. URL
-        // equality otherwise changes when resolution discovers it is a folder.
-        self.root = URL(fileURLWithPath: root.standardizedFileURL.resolvingSymlinksInPath().path, isDirectory: true)
-        try fm.createDirectory(at: self.root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        // Create through the caller's checked spelling first. Resolving an
+        // absent path can preserve a symlink alias (for example /private/tmp);
+        // after creation the child URLs resolve through its canonical spelling.
+        try fileManager.createDirectory(at: suppliedRoot, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let createdValues = try suppliedRoot.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        guard createdValues.isSymbolicLink != true, createdValues.isDirectory == true else {
+            throw PipMeetingLibraryError.unsafePath
+        }
+        let canonicalRoot = URL(
+            fileURLWithPath: suppliedRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+            isDirectory: true
+        )
+        let canonicalValues = try canonicalRoot.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        guard canonicalValues.isSymbolicLink != true, canonicalValues.isDirectory == true,
+              canonicalRoot.resolvingSymlinksInPath().standardizedFileURL.path == canonicalRoot.standardizedFileURL.path else {
+            throw PipMeetingLibraryError.unsafePath
+        }
+        self.root = canonicalRoot
         try checkRoot()
         try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: self.root.path)
         try reload()
