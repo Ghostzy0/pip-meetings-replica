@@ -4,7 +4,7 @@ An independent local macOS recreation effort for selected meeting-workflow patte
 
 **Experimental Neutral Core Replica.** This export contains one edition: `baseline`. No Pip custom editions or upstream provenance build are included.
 
-**Known native limits (24 Oct 2026):** One same-binary synthetic run failed to open note detail and a process sample showed the main thread blocked in a filesystem permission call during library initialization; the operating-system/filesystem cause is unconfirmed. A later run with a separate temporary data root opened the note, saved/reopened title and notes edits, and added a manual action. This is partial evidence only: it does not establish why the first run stalled, full CRUD, or export.
+**Known native limits (25 Oct 2026):** The source now validates a newly created library root before canonicalizing its path; focused internal library/persistence and root-link tests passed. Hosted CI results are tracked separately from those local checks. A private diagnostic Replica build saved one synthetic first note but stayed on Home; the first-create process ID was not sampled. In a separate run, an existing synthetic note opened after its live process identity was verified against the intended frozen app. Recording, complete note UX and reference parity remain unverified.
 
 [![Verify exported Meetings product](https://github.com/Ghostzy0/pip-meetings-replica/actions/workflows/verify.yml/badge.svg?branch=main)](https://github.com/Ghostzy0/pip-meetings-replica/actions/workflows/verify.yml) · [Verification](PUBLIC-VERIFICATION.md) · [Report an issue](https://github.com/Ghostzy0/pip-meetings-replica/issues/1) · [Pip Meetings custom edition](https://github.com/Ghostzy0/pip-meetings)
 

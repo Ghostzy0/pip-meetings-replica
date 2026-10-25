@@ -14,6 +14,63 @@ final class PipMeetingLibraryTests: XCTestCase {
         XCTAssertEqual(try PipMeetingLibrary(root: root).meetings.first?.id, id)
     }
 
+    func testMissingPrivateTmpRootCanCreateAndReopen() throws {
+        let parent = URL(fileURLWithPath: "/private/tmp/pip-meetings-missing-root-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("data", isDirectory: true)
+            .appendingPathComponent("pip-library", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+
+        let library = try PipMeetingLibrary(root: root)
+        let id: UUID
+        do {
+            id = try library.create(title: "Private tmp root")
+        } catch {
+            XCTFail("A newly created private-tmp library should accept its first meeting: \(error)")
+            return
+        }
+        XCTAssertEqual(try PipMeetingLibrary(root: root).meetings.first?.id, id)
+    }
+
+    func testSymlinkedLibraryRootIsRejectedWithoutTouchingTarget() throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("pip-meetings-root-link-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let target = parent.appendingPathComponent("target", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        let targetModeBefore = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber)?.intValue
+        ) & 0o777
+        let sentinel = target.appendingPathComponent("sentinel")
+        try Data("preserve".utf8).write(to: sentinel)
+        let link = parent.appendingPathComponent("linked-library", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        XCTAssertThrowsError(try PipMeetingLibrary(root: link)) { error in
+            XCTAssertEqual(error as? PipMeetingLibraryError, .unsafePath)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path), ["sentinel"])
+        XCTAssertEqual(try String(contentsOf: sentinel, encoding: .utf8), "preserve")
+        let targetModeAfter = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber)?.intValue
+        ) & 0o777
+        XCTAssertEqual(targetModeAfter, targetModeBefore)
+    }
+
+    func testDanglingSymlinkedLibraryRootDoesNotCreateTarget() throws {
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent("pip-meetings-dangling-root-link-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let missingTarget = parent.appendingPathComponent("missing-target", isDirectory: true)
+        let link = parent.appendingPathComponent("dangling-library", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: missingTarget)
+        _ = try FileManager.default.destinationOfSymbolicLink(atPath: link.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missingTarget.path))
+
+        XCTAssertThrowsError(try PipMeetingLibrary(root: link))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missingTarget.path))
+    }
+
     func testCRUDSearchAndFreshInstanceReopen() throws {
         let fixture = try Fixture(); defer { fixture.remove() }
         let library = try fixture.library()
