@@ -1,5 +1,10 @@
 # Change notes
 
+## Unreleased
+
+- Preserve the previous generated app and its matching release metadata in a unique historical directory before package replacement; restore the prior package if promotion fails.
+- Add focused filesystem promotion and release-integrity checks to CI before native packaging.
+
 ## 0.1.0-alpha.1 · development
 
 - Preserve pinned MIT Meeting Transcriber0.8.1 native baseline and its licence notices.
